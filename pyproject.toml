@@ -1,18 +1,13 @@
 [project]
-name = "flash-stu"
-version = "1.0.0"
-description = "An optimized, open-source PyTorch implementation of the Spectral Transform Unit (STU)"
+name = "thesis"
+version = "0.0.1"
+description = "Windsor Nguyen's Senior Thesis"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = {file = "LICENSE"}
 
 authors = [
-    { name = "Isabel Liu", email = "isabel.liu@princeton.edu" },
     { name = "Windsor Nguyen", email = "windsor@princetonalignment.org" },
-    { name = "Yagiz Devre", email = "yagiz.devre@princeton.edu" },
-    { name = "Evan Dogariu", email = "ed2719@nyu.edu" },
-    { name = "Anirudha Majumdar", email = "ani.majumdar@princeton.edu" },
-    { name = "Elad Hazan", email = "ehazan@princeton.edu" }
 ]
 
 maintainers = [
@@ -37,31 +32,37 @@ classifiers = [
 ]
 
 dependencies = [
-    "packaging==24.1",
-    "wheel==0.44.0",
-    "numpy==1.26.4",
-    "ninja==1.11.1.1",
-    "torch==2.4.1",
-    "triton==3.0.0",
-    "einops==0.8.0",
-    "liger-kernel==0.2.1",
-    "tiktoken==0.7.0",
-    "transformers==4.44.0",
-    "datasets==2.20.0",
-    "safetensors==0.4.4",
-    "psutil==6.0.0",
-    "matplotlib==3.9.2",
+    "numpy>=1.26.4",
+    "ninja>=1.11.1.1",
+    "torch>=2.5.1",
+    "triton>=3.0.0",
+    "einops>=0.8.0",
+    "liger-kernel>=0.2.1",
+    "tiktoken>=0.7.0",
+    "transformers>=4.44.0",
+    "datasets>=2.20.0",
+    "safetensors>=0.4.4",
+    "wandb>=0.19.0",
+    "psutil>=6.0.0",
+    "matplotlib>=3.9.2",
+    "ipykernel>=6.29.5",
+    "colorama>=0.4.6",
+    "orjson>=3.10.12",
+    "pynvml>=12.0.0",
+    "nvidia-ml-py>=12.570.86",
+    "plotly>=6.0.0",
+    # "kaleido==0.2.1.post1",
 ]
 
 [tool.setuptools]
-packages = ["flash_stu"]
+packages = ["thesis"]
 
 # ===============================
 # Project URLs
 # ===============================
 [project.urls]
 Homepage = "https://arxiv.org/abs/2409.10489"
-Repository = "https://github.com/windsornguyen/flash-stu"
+Repository = "https://github.com/windsornguyen/senior-thesis"
 
 # ===============================
 # Ruff Configuration
@@ -95,7 +96,7 @@ exclude = [
 # General Ruff settings
 line-length = 119
 indent-width = 4
-target-version = "py311"
+target-version = "py312"
 
 # -------------------------------
 # Ruff Linting Rules

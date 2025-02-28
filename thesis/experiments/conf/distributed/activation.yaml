@@ -1,0 +1,11 @@
+checkpoint:
+  mode: full  # none, selective, full
+  selective_ac_option: "2"  # checkpoint every nth layer
+
+offloading:
+  enable: false
+  use_pin_memory: true
+  use_streams: auto  # auto, true, false
+  max_fwd_stash_size: 5
+  min_offload_size: 1024
+  virtual_memory_safe_pct: 60.0

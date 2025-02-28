@@ -1,0 +1,102 @@
+task:
+  model:
+    model_type: transformer
+    bsz: 64
+    dim: 64
+    d_in: ${copy_compute_d_in:${task.params.vocab_size},${task.params.one_hot}}
+    d_out: ${copy_compute_total_vocab:${task.params.vocab_size}}
+    num_heads: 8
+    num_layers: 2
+    seq_len: ${copy_compute_seq_len:${task.params.copy_len},${task.params.blank_len},${task.params.selective}}
+    window_size: ${task.model.seq_len}
+    vocab_size: ${copy_compute_total_vocab:${task.params.vocab_size}}
+    mlp_scale: 4
+    bias: false
+    dropout: 0.0
+    softcap: 50.0
+    theta: 10000.0
+    use_alibi: false
+    torch_dtype: bfloat16
+    attention:
+      type: causal
+      causal: true
+      dilation: 1
+  name: copy
+  params:
+    vocab_size: 26
+    copy_len: 509
+    blank_len: 509
+    selective: false
+    one_hot: false
+    seed: 1746
+    dtype: bfloat16
+    num_examples: 400000
+training:
+  optimizer:
+    name: AdamW
+    lr: 0.001
+    betas:
+    - 0.9
+    - 0.95
+    eps: 1.0e-08
+    weight_decay: 0.1
+    amsgrad: false
+    fused: true
+  scheduler:
+    num_warmup_steps: 40000
+    num_steps: 400000
+  batch_size: 64
+  max_steps: 10000
+  eval_period: 50
+  dtype: bfloat16
+  device: cuda
+  gradient_accumulation:
+    enabled: true
+    steps: null
+    desired_batch_size: null
+    desired_tokens_per_step: null
+opt:
+  enable_float8_linear: false
+  enable_fsdp_float8_all_gather: true
+  precompute_float8_dynamic_scale_for_fsdp: true
+distributed:
+  dp_replicate: 1
+  dp_shard: -1
+  cp: 1
+  tp: 1
+  pp: 1
+  enable_loss_parallel: false
+  pipeline_parallel_split_points: []
+  pipeline_parallel_schedule: 1F1B
+  pipeline_parallel_microbatches: null
+  enable: false
+  folder: checkpoint
+  interval_type: steps
+  interval: 500
+  model_weights_only: false
+  export_dtype: float32
+  create_seed_checkpoint: false
+  async_mode: disabled
+  keep_latest_k: 0
+  load_step: -1
+  checkpoint:
+    mode: full
+    selective_ac_option: '2'
+  offloading:
+    enable: false
+    use_pin_memory: true
+    use_streams: auto
+    max_fwd_stash_size: 5
+    min_offload_size: 1024
+    virtual_memory_safe_pct: 60.0
+  init_timeout_seconds: 300
+  train_timeout_seconds: 100
+  trace_buf_size: 20000
+model: ${task.model}
+model_type: ${model.model_type}
+logging:
+  wandb: false
+  log_dir: logs
+  save_period: 100000
+  freq: 5000
+  acc_freq: null

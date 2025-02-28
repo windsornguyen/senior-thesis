@@ -1,0 +1,40 @@
+{
+  "os": "Linux-4.18.0-553.37.1.el8_10.x86_64-x86_64-with-glibc2.28",
+  "python": "CPython 3.12.7",
+  "startedAt": "2025-02-17T02:48:10.772273Z",
+  "program": "-m thesis.experiments.training.train",
+  "git": {
+    "remote": "https://github.com/windsornguyen/flash-stu",
+    "commit": "c53ee8f9f74e5c5afb703ee409e8b232ba90e616"
+  },
+  "root": "results/copy_transformer_0431cc2022e8",
+  "host": "della-pli.princeton.edu",
+  "username": "mn4560",
+  "executable": "/scratch/gpfs/mn4560/.conda/envs/thesis/bin/python3",
+  "cpu_count": 48,
+  "cpu_count_logical": 48,
+  "gpu": "NVIDIA H100 PCIe",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "226535866368",
+      "used": "172364103680"
+    }
+  },
+  "memory": {
+    "total": "539857739776"
+  },
+  "cpu": {
+    "count": 48,
+    "countLogical": 48
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA H100 PCIe",
+      "memoryTotal": "85520809984",
+      "cudaCores": 14592,
+      "architecture": "Hopper"
+    }
+  ],
+  "cudaVersion": "12.8"
+}

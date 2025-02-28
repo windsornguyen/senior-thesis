@@ -1,0 +1,22 @@
+name: copy
+
+params:
+  vocab_size: 26  # Regular tokens
+  copy_len: 509
+  blank_len: 509
+  selective: true
+  one_hot: false
+  seed: 1746
+  dtype: bfloat16
+  num_examples: 400000
+
+defaults:
+  - /model/transformer
+
+# Model overrides
+model:
+  d_in: ${copy_compute_d_in:${task.params.vocab_size},${task.params.one_hot}}
+  d_out: ${copy_compute_total_vocab:${task.params.vocab_size}}
+  seq_len: ${copy_compute_seq_len:${task.params.copy_len},${task.params.blank_len},${task.params.selective}}
+  window_size: ${task.model.seq_len}  # Global attention
+  vocab_size: ${copy_compute_total_vocab:${task.params.vocab_size}}

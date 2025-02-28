@@ -1,0 +1,20 @@
+model_type: STU
+
+bsz: 1
+n_embd: 1536
+n_heads: 8
+num_layers: 26
+seq_len: 8192
+vocab_size: 200064
+mlp_scale: 12
+bias: false
+dropout: 0.0
+num_eigh: 24
+use_hankel_L: false
+use_approx: true
+dtype: bfloat16
+
+# Derived attributes
+hidden_size: ${n_embd}
+intermediate_size: ${n_embd} * ${mlp_scale}
+hidden_act: swish

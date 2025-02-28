@@ -1,0 +1,3 @@
+init_timeout_seconds: 300
+train_timeout_seconds: 100
+trace_buf_size: 20000  # flight recorder ring buffer size (0 = disabled)

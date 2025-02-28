@@ -1,0 +1,38 @@
+model: ${task.model}
+
+defaults:
+  - task: copy  # Set the model in the task file.
+  - training/optimizer: adamw
+  - training/scheduler: linear
+  - opt/float8
+  - distributed/parallelism
+  - distributed/checkpoint 
+  - distributed/activation
+  - distributed/comm
+  - _self_
+
+model_type: ${model.model_type}
+
+training:
+  batch_size: 64
+  max_steps: 10000 # ~64 epochs, 6250 steps per epoch
+  eval_period: 50
+  dtype: bfloat16
+  device: cuda  # will fallback to cpu if cuda not available
+
+  gradient_accumulation:
+    enabled: true  # master switch
+
+    # Option 1: Manual mode (simple synthetic experiments)
+    steps: null  # if set, directly uses this many accumulation steps
+
+    # Option 2: Auto mode (for pretraining-style workloads)
+    desired_batch_size: null  # target global batch size
+    desired_tokens_per_step: null  # alternative token-based target (for LLM pretraining)
+
+logging:
+  wandb: false  # set to true if you want to use wandb
+  log_dir: logs # TODO: consider merging with results (no need for results/log folder) or specify that it's specifically for logs/plots
+  save_period: 100000  # save checkpoints every N steps
+  freq: 5000  # log metrics every N steps
+  acc_freq: null  # optional separate frequency for accumulation metrics

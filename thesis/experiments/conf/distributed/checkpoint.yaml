@@ -1,0 +1,10 @@
+enable: false
+folder: checkpoint
+interval_type: steps  # steps or seconds
+interval: 500
+model_weights_only: false  # true = only save weights, false = full checkpoint
+export_dtype: float32  # float16, bfloat16, float32
+create_seed_checkpoint: false
+async_mode: disabled  # disabled, async, async_with_pinned_mem
+keep_latest_k: 0  # 0 = keep all
+load_step: -1  # -1 = load latest

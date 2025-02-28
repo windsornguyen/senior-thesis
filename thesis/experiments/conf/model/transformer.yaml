@@ -1,0 +1,25 @@
+# @package: model
+model_type: transformer
+
+bsz: 64
+dim: 64
+d_in: 10  # Dynamically computed by a resolver
+d_out: 10  # Dynamically computed by a resolver
+num_heads: 8
+num_layers: 2
+seq_len: 30 # Dynamically computed by a resolver
+window_size: 30 # Dynamically computed by a resolver
+vocab_size: 26
+mlp_scale: 4
+bias: false
+dropout: 0.0
+softcap: 50.0
+theta: 10000.0
+use_alibi: false
+torch_dtype: bfloat16
+
+# Attention mask config
+attention:
+  type: causal  # options: causal, sliding_window, dilated_window
+  causal: true  # whether to enforce causality for window-based attention
+  dilation: 1   # dilation factor for dilated window (if used)

@@ -11,6 +11,7 @@ __pycache__/
 .empty/
 **/*.out
 log*/
+**/outputs/
 ignore/
 
 # ===============================
@@ -22,11 +23,6 @@ data/
 # Scripts and tests
 # ===============================
 **/*test*.*
-
-# ===============================
-# Plotting (To be added in the next commit)
-# ===============================
-plot.py
 
 # ===============================
 # C Extensions

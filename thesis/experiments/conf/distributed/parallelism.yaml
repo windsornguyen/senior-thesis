@@ -1,0 +1,11 @@
+dp_replicate: 1  # data parallel replicate degree
+dp_shard: -1     # data parallel shard degree (-1 = auto)
+cp: 1            # context parallel degree
+tp: 1            # tensor parallel degree
+pp: 1            # pipeline parallel degree
+enable_loss_parallel: false
+
+# Pipeline parallel specific configs
+pipeline_parallel_split_points: []
+pipeline_parallel_schedule: "1F1B"  # options: 1F1B, GPipe, etc.
+pipeline_parallel_microbatches: null  # if null, uses number of pipeline stages

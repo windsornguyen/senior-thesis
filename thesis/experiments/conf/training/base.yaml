@@ -1,0 +1,5 @@
+# TODO: What does this do?
+
+defaults:
+  - training/optimizer: adamw
+  - training/scheduler: linear

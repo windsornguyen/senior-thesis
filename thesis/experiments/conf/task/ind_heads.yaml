@@ -1,0 +1,11 @@
+name: ind_heads
+params:
+  num_examples: 1000
+  sequence_len: 512
+  vocab_size: 64
+  min_prefix_len: 2
+  max_prefix_len: 5
+  min_pattern_len: 2
+  max_pattern_len: 5
+  num_patterns: 1
+  seed: 1746
