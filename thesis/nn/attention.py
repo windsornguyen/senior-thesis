@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-from attention_masks import causal_mask
+from thesis.nn.attention_masks import causal_mask
 
 
 class Attention(nn.Module):

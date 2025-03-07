@@ -107,11 +107,11 @@ from torch.utils.data import TensorDataset
 
 def generate_assoc_recall(
     num_examples: int = 100000,
-    sequence_len: int = 512,
+    sequence_len: int = 128,
     vocab_size: int = 8192,
-    num_pairs: int = 64,
+    num_pairs: int = 4,
     random_non_queries: bool = True,
-    num_queries: int = 1,
+    num_queries: int = 3,
     seed: int = 1746,
 ):
     """
@@ -187,17 +187,17 @@ def generate_assoc_recall(
     queries = keys.gather(1, chosen_idxs)
     query_labels = values.gather(1, chosen_idxs)
 
-    # Randomly choose positions in the remaining part of the sequence to insert queries.
-    pos_choices = torch.arange(context_size, sequence_len + 1, dtype=torch.long).unsqueeze(0).expand(num_examples, -1)
-    rand_pos = torch.rand(num_examples, sequence_len + 1 - context_size)
+    # Randomly choose positions up to sequence_len - 1
+    pos_choices = torch.arange(context_size, sequence_len, dtype=torch.long).unsqueeze(0).expand(num_examples, -1)
+    rand_pos = torch.rand(num_examples, sequence_len - context_size)
     _, pos_perm = rand_pos.sort(dim=1)
     query_pos = pos_choices.gather(1, pos_perm[:, :num_queries])
 
-    # Insert queries into inputs and their labels into targets.
+    # Insert queries into inputs and their labels into targets at query_pos + 1
     inputs[rows, query_pos] = queries
-    targets[rows, query_pos] = query_labels  # removed the '+ 1' here
+    targets[rows, query_pos + 1] = query_labels  # Shift target to next position
 
-    # Shift inputs/targets by one to get final shapes.
+    # Shift inputs/targets by one to get final shapes
     inputs = inputs[:, :-1]
     targets = targets[:, 1:]
 

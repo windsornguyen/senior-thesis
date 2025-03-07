@@ -5,14 +5,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import time
+import triton.language as tl
+import argparse
+
 from typing import Tuple
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
-from thesis.experiments.synthetics.copy_task import generate_copy_dataset
+from thesis.experiments.synthetics.copying import generate_copy_dataset
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 torch.set_float32_matmul_precision("high")
+
+
+def apply_compile(model: nn.Module) -> None:
+    """
+    Apply torch.compile to each Flash STU block. This makes compilation efficient
+    due to repeated structure. Alternatively, one can compile the whole model
+    (after applying DP).
+    """
+    print(f"Compiling each {model.__class__.__name__} block with torch.compile...")
+    start = time.perf_counter()
+    for layer_id, block in model.named_children():
+        block = torch.compile(block)
+        model.register_module(layer_id, block)
+    end = time.perf_counter()
+    print(f"Finished compiling each {model.__class__.__name__} block in {end - start:.4f} seconds.")
+
 
 class CustomMultiHeadAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0):
@@ -143,6 +165,7 @@ class MLP(nn.Module):
         w2 (nn.Module): Linear layer for hidden-to-output transformation.
         w3 (nn.Module): Additional linear layer for feature transformation.
     """
+
     def __init__(self, dim: int, inter_dim: int):
         """
         Initializes the MLP layer.
@@ -166,7 +189,7 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(F.gelu(self.w1(x), approximate="tanh") * self.w3(x))
 
 
 def get_monic_chebyshev_coeffs(n: int) -> torch.Tensor:
@@ -204,10 +227,10 @@ def get_hankel(seq_len: int, use_hankel_L: bool = False, device=None) -> torch.T
 
 
 def get_spectral_filters(
-    seq_len: int, K: int, use_hankel_L: bool = False, device: torch.device = None, dtype: torch.dtype = torch.bfloat16
+    seq_len: int, K: int, use_hankel_L: bool = False, device: torch.device = None, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     Z = get_hankel(seq_len, use_hankel_L).to(device)
-    sigma, phi = torch.linalg.eigh(Z)
+    sigma, phi = torch.linalg.eigh(Z, UPLO="U")
     sigma_k, phi_k = sigma[-K:], phi[:, -K:]
     epsilon = 1e-9
     sigma_k = sigma_k.clamp_min(epsilon)
@@ -229,7 +252,7 @@ def get_tensorized_spectral_filters(
     k: int = 24,
     use_hankel_L: bool = False,
     device: torch.device = None,
-    dtype: torch.dtype = torch.bfloat16,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     T_prime, sqrt_T_prime, k_max = compute_dimensions(n)
     k = min(k, k_max)
@@ -306,7 +329,7 @@ def integrate_polar_monomial(a, b, beta):
     )
 
 
-def get_polynomial_hankel(n, beta, t, chunk_size=2048, device="cuda", dtype=torch.bfloat16):
+def get_polynomial_hankel(n, beta, t, chunk_size=2048, device="cuda", dtype=torch.float32):
     """ """
     matrix_size = t - n
 
@@ -365,7 +388,7 @@ def get_polynomial_spectral_filters(
     seq_len: int,
     k: int,
     device: torch.device = None,
-    dtype: torch.dtype = torch.bfloat16,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     n = get_opt_degree(seq_len)
     beta = 1.0 / (64.0 * n**2)
@@ -381,9 +404,127 @@ def get_polynomial_spectral_filters(
     return phi_k.real.to(dtype)
 
 
+def nearest_power_of_two(x: int, round_up: bool = False) -> int:
+    return 1 << math.floor(math.log2(x)) if not round_up else 1 << math.ceil(math.log2(x))
+
+
+def fft_conv(u: torch.Tensor, v: torch.Tensor, mode: str = "full", causal: bool = False) -> torch.Tensor:
+    """
+    Perform generic convolution using FFT. Supports various modes and filter shapes.
+
+    Args:
+        u: Input tensor of shape (B, L, d).
+        v: Filter tensor of shape (F, d) or (F, d, k) for k filters.
+        mode: Convolution mode ('full', 'same', 'valid').
+        causal: Whether to apply causal convolution (default: False).
+
+    Returns:
+        Convolved tensor of shape depending on mode:
+            - 'full': (B, L + F - 1, d[, k])
+            - 'same': (B, L, d[, k])
+            - 'valid': (B, L - F + 1, d[, k])
+    """
+    assert mode in {"full", "same", "valid"}, f"Invalid mode '{mode}'"
+    B, L, d = u.shape
+
+    # Ensure v has shape (F, d, k)
+    if v.ndim == 2:
+        F_len, d_v = v.shape
+        assert d == d_v, "Filter and input dimensions must match."
+        v = v.unsqueeze(-1)  # shape (F, d, 1)
+    elif v.ndim == 3:
+        F_len, d_v, _ = v.shape
+        assert d == d_v, "Filter and input dimensions must match."
+    else:
+        raise ValueError("Filter tensor must be either (F, d) or (F, d, k)")
+
+    conv_len = L + F_len - 1
+    fft_len = nearest_power_of_two(conv_len, round_up=True)
+
+    # Pad u along its length dimension (last dimension remains d)
+    u_padded = F.pad(u, (0, 0, 0, fft_len - L)).to(torch.float32)  # (B, fft_len, d)
+    # Pad v along its first dimension (filter length) using a 6-tuple.
+    v_padded = F.pad(v, (0, 0, 0, 0, 0, fft_len - F_len)).to(torch.float32)  # (fft_len, d, k)
+
+    U_fft = torch.fft.rfft(u_padded, n=fft_len, dim=1)  # (B, fft_len//2+1, d)
+    V_fft = torch.fft.rfft(v_padded, n=fft_len, dim=0)  # (fft_len//2+1, d, k)
+
+    U_fft = U_fft.unsqueeze(-1)  # (B, fft_len//2+1, d, 1)
+    V_fft = V_fft.unsqueeze(0).expand(B, -1, -1, -1)  # (B, fft_len//2+1, d, k)
+
+    conv_result = torch.fft.irfft(U_fft * V_fft, n=fft_len, dim=1)  # (B, fft_len, d, k)
+
+    if causal:
+        start_idx = F_len - 1
+    else:
+        start_idx = 0
+
+    if mode == "full":
+        end_idx = start_idx + conv_len
+    elif mode == "same":
+        end_idx = start_idx + L
+    elif mode == "valid":
+        end_idx = start_idx + L - F_len + 1
+
+    result = conv_result[:, start_idx:end_idx]
+
+    if result.shape[-1] == 1:
+        result = result.squeeze(-1)
+
+    return result.to(dtype=u.dtype)
+
+
+def stu_conv(
+    u: torch.Tensor, v: torch.Tensor, n: int, use_tensordot: bool = True
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Performs FFT-based convolution with causal alignment using a negative featurization.
+
+    The input tensor u is modulated by an alternating sign tensor (sgn) that multiplies every other
+    time step by -1. This "negative featurization" modulates the phase so that in this implementation
+    the correct causal output is obtained by simply slicing the first seq_len elements (i.e. [:seq_len]).
+    Note: Using a conventional slice [seq_len-1:2*seq_len-1] would yield a flipped alignment, resulting in leakage.
+
+    Args:
+        u: Input tensor of shape (B, seq_len, d_in).
+        v: Kernel tensor; expected shape is (seq_len, d_out) if use_tensordot is True.
+        n: FFT length (typically set to 2*seq_len - 1 for linear convolution with implicit right zero-padding).
+        use_tensordot: Boolean flag to control kernel reshaping.
+
+    Returns:
+        A tuple (U_plus, U_minus) where:
+          - U_plus is the primary convolution output.
+          - U_minus is the secondary output, corrected by the sign tensor.
+    """
+    bsz, seq_len, d_in = u.shape
+
+    sgn = torch.full((1, seq_len, 1), 1, device=u.device)
+    sgn[:, 1::2] *= -1  # Apply negative featurization: multiply every other element by -1.
+
+    if use_tensordot:
+        _, d_out = v.shape
+        v = v.view(1, -1, d_out, 1).to(torch.float32).contiguous()
+    else:
+        _, K = v.shape
+        sgn = sgn.unsqueeze(-1)
+        v = v.view(1, -1, K, 1, 1).to(torch.float32).contiguous()  # (bsz, seq_len, K, d_in, stack)
+        u = u.view(bsz, -1, 1, d_in).expand(bsz, -1, K, d_in)
+
+    v = torch.fft.rfft(v, n=n, dim=1)
+
+    U = torch.stack([u, u * sgn], dim=-1).to(torch.float32).contiguous()
+    U = torch.fft.rfft(U, n=n, dim=1)
+    # Slicing the first seq_len outputs yields the proper causal convolution given the negative modulation.
+    U_conv = torch.fft.irfft(v * U, n=n, dim=1)[:, :seq_len]
+    U_plus, U_minus = torch.unbind(U_conv, dim=-1)
+    U_minus = U_minus * sgn
+
+    return U_plus, U_minus
+
+
 class LearnableSpectralFilters(nn.Module):
     def __init__(
-        self, seq_len: int, k: int, use_hankel_L: bool = False, device=None, dtype: torch.dtype = torch.bfloat16
+        self, seq_len: int, k: int, use_hankel_L: bool = False, device=None, dtype: torch.dtype = torch.float32
     ):
         super().__init__()
         filters = get_spectral_filters(seq_len, k, use_hankel_L, device, dtype)
@@ -488,88 +629,134 @@ def chunked_tril_sum(
 
 
 class SpectralAttention(nn.Module):
-    """
-    SpectralAttention implements a spectral-based attention mechanism.
-    It projects inputs into a (B, T, seq_len) space, applies linear transformations
-    to obtain queries (Q), and obtains spectral filters (K, V) for keys and values.
-    The attention output is produced via a sequence of einsum operations,
-    finally projected back to the model dimension.
-
-    Args:
-        seq_len (int): Sequence length (T).
-        d_model (int): Model dimension.
-        k (int): The projection dimension for Q, K, and V filters.
-        use_hankel_L (bool): Whether to use a Hankel matrix in computing the attention.
-        device: Torch device.
-    """
     def __init__(
         self,
         seq_len: int,
         d_model: int,
         k: int,
+        num_heads: int = 4,
         use_hankel_L: bool = False,
-        device=None
+        use_tensordot: bool = True,
+        r: int = 64,
+        device=None,
+        dtype=torch.float32,
     ):
         super().__init__()
         self.seq_len = seq_len
-        dtype = torch.bfloat16
+        self.d_model = d_model
+        self.d_out = d_model  # Same for now
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.use_tensordot = use_tensordot
+        self.use_hankel_L = use_hankel_L
+        self.n = nearest_power_of_two(seq_len * 2 - 1, round_up=True)
+        self.K = k  # num_eigh
+        self.r = r
 
-        # Optionally project input from d_model -> seq_len
-        self.pre_proj = (
-            nn.Linear(d_model, seq_len, device=device, dtype=dtype)
-            if d_model != seq_len else
-            nn.Identity()
+        # STU filters
+        self.stu_filters = get_spectral_filters(seq_len, k, use_hankel_L, device, dtype)
+
+        # Chebyshev coefficients
+        self.p_coeffs_kernel = (
+            torch.tensor(get_monic_chebyshev_coeffs(get_opt_degree(seq_len)), device=device)
+            .view(-1, 1)
+            .repeat(1, d_model)
         )
 
-        # Query, Key, Value transforms
-        self.q_proj = nn.Linear(seq_len, k, device=device, dtype=dtype)
-        self.K = LearnableSpectralFilters(seq_len, k, use_hankel_L, device, dtype=dtype)
-        self.V = LearnableSpectralFilters(seq_len, k, use_hankel_L, device, dtype=dtype)
-        self.o_proj = nn.Linear(k, d_model, device=device, dtype=dtype)
+        # STU projection matrices
+        if use_tensordot:
+            self.M_inputs = nn.Parameter(torch.empty(d_model, r, dtype=dtype, device=device))
+            self.M_filters = nn.Parameter(torch.empty(k, r, dtype=dtype, device=device))
+            self.out_proj_stu = nn.Linear(r, d_model, bias=True, device=device, dtype=dtype)
+        else:
+            self.M_phi_plus = nn.Parameter(torch.empty(k, d_model, d_model, dtype=dtype, device=device))
+            if not use_hankel_L:
+                self.M_phi_minus = nn.Parameter(torch.empty(k, d_model, d_model, dtype=dtype, device=device))
+
+        # Attention components
+        self.Q = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.K = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.V = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.o_proj = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+
+        # Gate for combining attention and spectral features
+        self.gate = nn.Linear(d_model, d_model, device=device, dtype=dtype)
 
         # Normalization
+        self.stu_norm1 = nn.RMSNorm(d_model)
         self.norm = nn.RMSNorm(d_model)
 
-        # Hankel matrix L (shape [T, T]); masked to be lower-triangular
-        L = get_hankel(seq_len, use_hankel_L, device=device).to(dtype)
-        self.L = nn.Parameter(torch.tril(L))
+    def compute_stu_features(self, u: torch.Tensor) -> torch.Tensor:
+        """Compute STU features"""
+        B, T, d = u.shape
 
+        # Convolve inputs w/ Chebyshev coefficients, per https://arxiv.org/pdf/2502.06545
+        p_coeffs_conv = -fft_conv(u, self.p_coeffs_kernel, mode="same", causal=True)
+
+        if self.use_tensordot:
+            # Project first
+            u_proj = u @ self.M_inputs  # (B, L, d_in) x (d_in, r) -> (B, L, r)
+            p_coeffs_conv = p_coeffs_conv @ self.M_inputs  # (B, L, d_in) x (d_in, r) -> (B, L, r)
+            phi_proj = self.stu_filters @ self.M_filters  # (L, K) x (K, r) -> (L, r)
+
+            # Then, convolve: (B, L, r) ⊗ (L, r) -> (B, L, r)
+            spectral_plus, spectral_minus = stu_conv(u_proj, phi_proj, self.n, self.use_tensordot)
+
+            # Final output
+            out = spectral_plus if self.use_hankel_L else spectral_plus + spectral_minus
+            out = self.out_proj_stu(out + p_coeffs_conv)
+        else:
+            # Convolve first to get featurized inputs: (B, L, d_in) x (L, K) -> (B, L, K, d_in)
+            U_plus, U_minus = stu_conv(u, self.stu_filters, self.n, self.use_tensordot)
+
+            # Compute sum-product of featurized inputs and M matrices over the K filters
+            B, L, K, d_in = U_plus.shape
+
+            # Spectral output: (B, L, K * d_in) x (K * d_in, d_out) -> (B, L, d_out)
+            spectral_plus = U_plus.view(B, L, K * d_in) @ self.M_phi_plus.view(K * d_in, self.d_out)
+
+            if not self.use_hankel_L:
+                spectral_minus = U_minus.view(B, L, K * d_in) @ self.M_phi_minus.view(K * d_in, self.d_model)
+
+            out = spectral_plus if self.use_hankel_L else spectral_plus + spectral_minus
+            out = out + p_coeffs_conv
+
+        out = self.stu_norm1(out)
+        return out
+
+    @triton.jit
     def forward(self, x: torch.Tensor, chunk_len: int = 128) -> torch.Tensor:
-        """
-        Forward pass of SpectralAttention.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, T, d_model).
-            chunk_len (int): Chunk size for potential block-sum approach (unused).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, T, d_model).
-        """
         B, T, d = x.shape
 
-        # Optional pre-projection to match internal shape
-        x_proj = self.pre_proj(x)
+        # Branch 1: Compute STU features
+        x_tilde = self.compute_stu_features(x)  # (B, T, d_model)
 
-        # Compute query
-        Q = self.q_proj(x_proj)
+        # Branch 2: Compute multihead linear attention
+        Q = self.Q(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
+        K = self.K(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
+        V = self.V(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
 
-        # Compute Key and Value spectral filters
-        K_ = torch.einsum("bti,ik->btk", x_proj, self.K())
-        V_ = torch.einsum("bti,ik->btk", x_proj, self.V())
+        # Apply non-linearities
+        Q = F.gelu(Q, approximate="tanh")
+        K = F.gelu(K, approximate="tanh")
+        V = F.gelu(V, approximate="tanh")
 
-        # Outer product of K_ and V_ to get (B, T, k, k) but we keep dim naming
-        Z = torch.einsum("btp,btn->btpn", V_, K_)
+        # Linear attention computation
+        Z = torch.einsum("bhtp,bhtn->bhtpn", V, K)  # (B, H, T, d_head, d_head)
+        H = torch.cumsum(Z, dim=-2)  # (B, H, T, d_head, d_head)
+        Y = torch.einsum("bhtp,bhtpn->bhtn", Q, H)  # (B, H, T, d_head)
 
-        # Expand Hankel matrix L for each batch
-        L_batched = self.L.unsqueeze(0).expand(B, -1, -1)
+        # Merge heads
+        Y_attn = Y.permute(0, 2, 1, 3).contiguous().view(B, T, d)  # (B, T, d)
 
-        # Multiply L * Z => shape (B, T, p, n)
-        H = torch.einsum("bts,bspn->btpn", L_batched, Z)
+        # Compute gate values
+        gate_values = torch.sigmoid(self.gate(x))  # (B, T, d)
 
-        # Multiply Q * H => shape (B, T, n) => final
-        Y = torch.einsum("btk,btkn->btn", Q, H)
+        # Combine branches using element-wise gating
+        Y_combined = gate_values * Y_attn + (1 - gate_values) * x_tilde
 
-        return self.norm(self.o_proj(Y))
+        # Final projection and normalization
+        return self.o_proj(Y_combined)
 
 
 class SpectralAttentionLayer(nn.Module):
@@ -584,17 +771,25 @@ class SpectralAttentionLayer(nn.Module):
         use_hankel_L (bool): Whether to use a Hankel matrix.
         device: Torch device.
     """
+
     def __init__(
         self,
         seq_len: int,
         d_model: int,
         k: int,
+        num_heads: int = 4,
         use_hankel_L: bool = False,
-        device=None
+        use_tensordot: bool = True,
+        r: int = 64,
+        device=None,
     ):
         super().__init__()
-        self.spectral_attention = SpectralAttention(seq_len, d_model, k, use_hankel_L, device)
+        self.spectral_attention = SpectralAttention(
+            seq_len, d_model, k, num_heads, use_hankel_L, use_tensordot=use_tensordot, r=r, device=device
+        )
+        self.spec_attn_norm = nn.RMSNorm(d_model)
         self.mlp = MLP(d_model, 4 * d_model)
+        self.mlp_norm = nn.RMSNorm(d_model)
         self.norm = nn.RMSNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -607,9 +802,9 @@ class SpectralAttentionLayer(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (B, T, d_model).
         """
-        x = x + self.spectral_attention(x)
-        x = x + self.mlp(x)
-        return self.norm(x)
+        x = x + self.spectral_attention(self.spec_attn_norm(x))
+        x = x + self.mlp(self.mlp_norm(x))
+        return x
 
 
 class Spectron(nn.Module):
@@ -628,16 +823,20 @@ class Spectron(nn.Module):
         use_hankel_L (bool): Whether to use a Hankel matrix in the attention.
         device: Torch device.
     """
+
     def __init__(
         self,
         seq_len: int,
         d_model: int,
         k: int,
+        num_heads: int,
         vocab_size: int,
         d_out: int | None = None,
         num_layers: int = 1,
         dropout: float = 0.1,
         use_hankel_L: bool = False,
+        use_tensordot: bool = True,
+        r: int = 64,
         device=None,
     ):
         super().__init__()
@@ -645,19 +844,29 @@ class Spectron(nn.Module):
         if d_out is None:
             d_out = vocab_size
 
-        # Embedding and dropout
         self.embedding = nn.Embedding(vocab_size, d_model)
+
+        # Sinusoidal positional embeddings
+        position = torch.arange(seq_len, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, device=device) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(seq_len, d_model, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
         self.in_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-        # Stack of SpectralAttention layers
-        self.layers = nn.ModuleList([
-            SpectralAttentionLayer(seq_len, d_model, k, use_hankel_L, device=device)
-            for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                SpectralAttentionLayer(seq_len, d_model, k, num_heads, use_hankel_L, use_tensordot, r, device=device)
+                for _ in range(num_layers)
+            ]
+        )
 
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = nn.RMSNorm(d_model)
         self.out_proj = nn.Linear(d_model, d_out)
+        self.init_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -669,18 +878,121 @@ class Spectron(nn.Module):
         Returns:
             torch.Tensor: Output logits of shape (B, T, d_out).
         """
-        # Embed and apply dropout
-        x_emb = self.in_dropout(self.embedding(x))
+        B, T = x.shape
 
-        # Pass through stacked layers
+        # Add positional embeddings explicitly
+        x_emb = self.embedding(x) + self.pe.unsqueeze(0)
+        x_emb = self.in_dropout(x_emb)
+
         out = x_emb
         for layer in self.layers:
             out = layer(out)
 
-        # Normalize and project
         out = self.norm(out)
         out = self.out_proj(out)
         return self.out_dropout(out)
+
+    def init_weights(self):
+        def _init_weights(m):
+            if isinstance(m, nn.Linear):
+                # Initialize linear layers
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Parameter):
+                # Initialize parameter matrices
+                if any(x in m.shape for x in ["M_inputs", "M_filters", "M_phi"]):
+                    nn.init.normal_(m, std=0.02)
+
+        self.apply(_init_weights)
+
+
+class FlashSTUModel(nn.Module):
+    """Wrapper for FlashSTU to match the interface of other models."""
+
+    def __init__(
+        self,
+        seq_len: int,
+        d_model: int,
+        vocab_size: int,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        use_hankel_L: bool = False,
+        use_tensordot: bool = True,
+        device=None,
+    ):
+        super().__init__()
+        from thesis.models.flash_stu.model import FlashSTUConfig, FlashSTU
+
+        # Get spectral filters directly in bfloat16
+        k = math.ceil(math.log(seq_len))
+        phi = get_spectral_filters(
+            seq_len=seq_len,
+            K=k,
+            use_hankel_L=use_hankel_L,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+        # Create config with bfloat16
+        config = FlashSTUConfig(
+            bsz=1,
+            dim=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            seq_len=seq_len,
+            window_size=seq_len // 8,
+            vocab_size=vocab_size,
+            mlp_scale=4,
+            dropout=0.0,
+            num_eigh=k,
+            use_hankel_L=use_hankel_L,
+            use_tensordot=use_tensordot,
+            use_flash_fft=False,
+            use_attn=True,
+            torch_dtype=torch.bfloat16,
+        )
+
+        # Create model directly in bfloat16
+        self.model = FlashSTU(config, phi).to(device=device, dtype=torch.bfloat16)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Keep input as LongTensor, model will handle conversion after embedding
+        return self.model(x)  # Output stays in bfloat16
+
+
+class MambaModel(nn.Module):
+    """Wrapper for Mamba to match the interface of other models."""
+
+    def __init__(
+        self,
+        seq_len: int,
+        d_model: int,
+        vocab_size: int,
+        num_layers: int = 2,
+        device=None,
+    ):
+        super().__init__()
+        from thesis.models.mamba.model import MambaConfig, Mamba
+
+        # Create config
+        config = MambaConfig(
+            dim=d_model,
+            num_layers=num_layers,
+            vocab_size=vocab_size,
+            ssm_chunk_size=seq_len // 4,
+            weight_tying=False,
+            use_mem_eff_path=True,
+            torch_dtype=torch.bfloat16,
+        )
+
+        # Create model
+        self.model = Mamba(config).to(device=device)
+        self.model.init_weights(buffer_device=device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
 
 
 # -----------------------------------------------------------------------------
@@ -702,33 +1014,48 @@ def compute_token_level_accuracy(model, loader, attn_mask=None, device=device):
     correct_tokens = 0
     total_tokens = 0
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(loader):
+        for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            # Forward pass
             logits = model(inputs, mask=attn_mask) if isinstance(model, TransformerCopyModel) else model(inputs)
             predictions = logits.argmax(dim=-1)
-
-            # Create mask for valid tokens (not target_ignore_idx)
             valid_mask = targets != -100
-
-            # Calculate accuracy only on valid tokens
             match = (predictions == targets) & valid_mask
             correct_tokens += match.sum().item()
             total_tokens += valid_mask.sum().item()
 
-            # if batch_idx == 0:
-            #     print("\nDEBUG INFO (Token-level):")
-            #     for i in range(min(2, len(inputs))):
-            #         print(f"\nExample {i}:")
-            #         print("Input:     ", inputs[i].cpu().tolist())
-            #         print("Target:    ", targets[i].cpu().tolist())
-            #         print("Predicted: ", predictions[i].cpu().tolist())
-            #         print("Valid Mask:", valid_mask[i].cpu().tolist())
-            #     print()
-
     token_acc = 100.0 * correct_tokens / (total_tokens if total_tokens > 0 else 1)
-    print(f"Token-Level Accuracy (ignoring padding): {token_acc:.2f}%")
+    print(f"Overall Token-Level Accuracy: {token_acc:.2f}%")
     return token_acc
+
+
+def show_example_predictions(model, model_name: str, attn_mask=None):
+    """Show example predictions from the model on the first and last examples."""
+    model.eval()
+    with torch.no_grad():
+        first_input, first_target = train_dataset[0]
+        last_input, last_target = train_dataset[-1]
+        first_input = first_input.unsqueeze(0).to(device)
+        last_input = last_input.unsqueeze(0).to(device)
+
+        if isinstance(model, TransformerCopyModel):
+            first_logits = model(first_input, mask=attn_mask)
+            last_logits = model(last_input, mask=attn_mask)
+        else:
+            first_logits = model(first_input)
+            last_logits = model(last_input)
+
+        first_pred = first_logits.argmax(dim=-1).squeeze(0).cpu()
+        last_pred = last_logits.argmax(dim=-1).squeeze(0).cpu()
+
+        print(f"\n{model_name} - First Example")
+        print("Input:     ", train_dataset[0][0].cpu().tolist())
+        print("Target:    ", first_target.cpu().tolist())
+        print("Predicted: ", first_pred.tolist())
+
+        print(f"\n{model_name} - Last Example")
+        print("Input:     ", train_dataset[-1][0].cpu().tolist())
+        print("Target:    ", last_target.cpu().tolist())
+        print("Predicted: ", last_pred.tolist())
 
 
 # -----------------------------------------------------------------------------
@@ -736,56 +1063,79 @@ def compute_token_level_accuracy(model, loader, attn_mask=None, device=device):
 # -----------------------------------------------------------------------------
 def train_model(model, loader, val_loader, attn_mask=None, max_steps: int = 10000, eval_interval: int = 50):
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
-    optimizer = optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     model.train()
     loss_history = []
     accuracy_history = []
     eval_steps = []
     step = 0
     epoch = 0
+    latest_acc = 0.0
+
+    desc = f"Training {model.__class__.__name__}"
+    pbar = tqdm(total=max_steps, desc=desc)
+
     while step < max_steps:
         epoch += 1
         for inputs, targets in loader:
             if step >= max_steps:
                 break
-            inputs, targets = inputs.to(device), targets.to(device)
+
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+
             optimizer.zero_grad()
             logits = model(inputs, mask=attn_mask) if isinstance(model, TransformerCopyModel) else model(inputs)
-            # No need to shift logits - our targets are already aligned
             loss = criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
             loss.backward()
             optimizer.step()
+
             total_loss = loss.item()
             loss_history.append(total_loss)
             step += 1
+
+            # Update progress bar
+            pbar.set_postfix(loss=f"{total_loss:.4f}", acc=f"{latest_acc:.2f}%")
+            pbar.update(1)
 
             if step % eval_interval == 0:
                 acc = compute_token_level_accuracy(model, val_loader, attn_mask=attn_mask)
                 accuracy_history.append(acc)
                 eval_steps.append(step)
-                print(f"Step {step}/{max_steps} Loss: {total_loss:.4f} | Token-Level Accuracy: {acc:.2f}%")
-            else:
-                print(f"Step {step}/{max_steps} Loss: {total_loss:.4f}")
+                latest_acc = acc
+                pbar.set_postfix(loss=f"{total_loss:.4f}", acc=f"{acc:.2f}%")
+
+    pbar.close()
     return loss_history, accuracy_history, eval_steps
 
 
 # -----------------------------------------------------------------------------
-# Main
+# Main Training Loop
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # For v1, typical parameters might be:
-    #   vocab_size (including special tokens) = 16 (so regular tokens: 0...13, blank=14, copy=15)
-    #   seq_len = 256
-    #   num_tokens_to_copy = e.g. 16
-    selective = True  # Change as desired (selective task)
-    vocab_size = 16  # Here vocab_size includes regular tokens plus our two reserved indices
-    seq_len = 256
-    num_tokens_to_copy = 64
-    target_ignore_idx = -100
-    num_examples = 400000
-    rng = np.random.default_rng(1746)
+    parser = argparse.ArgumentParser(description="Train models on Copy task")
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        choices=["transformer", "spectron", "flashstu", "mamba", "all"],
+        help="Model to train (transformer, spectron, flashstu, mamba, or all)",
+    )
+    parser.add_argument("--steps", type=int, default=15000, help="Number of training steps")
+    parser.add_argument("--eval", type=int, default=250, help="Steps between evaluations")
+    parser.add_argument("--bsz", type=int, default=64, help="Batch size for training")
+    args = parser.parse_args()
 
-    # Generate training dataset using v1:
+    # Dataset parameters
+    vocab_size = 16
+    seq_len = 128
+    num_examples = 10000
+    num_tokens_to_copy = 16
+    target_ignore_idx = -100
+    selective = True
+    SEED = 1746
+
+    # Generate training dataset
     train_dataset = generate_copy_dataset(
         num_examples=num_examples,
         vocab_size=vocab_size,
@@ -793,151 +1143,120 @@ if __name__ == "__main__":
         num_tokens_to_copy=num_tokens_to_copy,
         target_ignore_idx=target_ignore_idx,
         selective=selective,
-        rng=rng,
+        rng=np.random.default_rng(SEED),
     )
-    loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    loader = DataLoader(train_dataset, batch_size=args.bsz, shuffle=True)
 
-    # For validation, generate a separate dataset:
+    # Generate validation dataset
     val_dataset = generate_copy_dataset(
-        num_examples=num_examples // 20,  # smaller validation set
+        num_examples=num_examples // 20,
         vocab_size=vocab_size,
         seq_len=seq_len,
         num_tokens_to_copy=num_tokens_to_copy,
         target_ignore_idx=target_ignore_idx,
         selective=selective,
-        rng=np.random.default_rng(1747),  # different seed for validation
+        rng=np.random.default_rng(SEED+1),
     )
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=args.bsz, shuffle=False)
 
-    # Create and compile TransformerCopyModel
-    trans_copy_model = TransformerCopyModel(
-        seq_len=seq_len,
-        d_model=64,  # Increased model capacity
-        vocab_size=vocab_size,
-        num_layers=2,  # Increased depth
-        num_heads=4,
-        dropout=0.1,
-    ).to(device)
-    # compiled_trans_model = torch.compile(trans_copy_model, fullgraph=True)
-    print("\nTraining TransformerCopyModel (v1)...")
-    loss_history_trans, acc_history_trans, eval_steps_trans = train_model(
-        trans_copy_model, loader, val_loader, max_steps=5000, eval_interval=500
-    )
+    models_to_train = []
+    if args.model == "all" or args.model == "transformer":
+        trans_model = TransformerCopyModel(
+            seq_len=seq_len,
+            d_model=64,
+            vocab_size=vocab_size,
+            num_layers=2,
+            num_heads=8,
+            dropout=0.1,
+        ).to(device)
+        models_to_train.append(("Transformer", trans_model))
 
-    # Create and compile Spectron
-    spectron = Spectron(
-        seq_len=seq_len,
-        d_model=64,
-        k=math.ceil(math.log(seq_len)),
-        vocab_size=vocab_size,
-        d_out=vocab_size,
-        num_layers=2,
-        dropout=0.0,
-        use_hankel_L=False,
-        device=device,
-    ).to(device=device, dtype=torch.bfloat16)
-    # compiled_spectron = torch.compile(spectron, fullgraph=True)
-    print("\nTraining Spectron (v1)...")
-    loss_history_spectron, acc_history_spectron, eval_steps_spectron = train_model(
-        spectron, loader, val_loader, max_steps=5000, eval_interval=500
-    )
+    if args.model == "all" or args.model == "spectron":
+        spectron = Spectron(
+            seq_len=seq_len,
+            d_model=64,
+            k=math.ceil(math.log(seq_len)),
+            num_heads=8,
+            vocab_size=vocab_size,
+            d_out=vocab_size,
+            num_layers=2,
+            dropout=0.1,
+            use_hankel_L=False,
+            use_tensordot=False,
+            r=64,
+            device=device,
+        ).to(device)
+        models_to_train.append(("Spectron", spectron))
 
-    # Plot results.
-    plt.style.use("seaborn-v0_8-darkgrid")
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    if args.model == "all" or args.model == "flashstu":
+        flash_stu = FlashSTUModel(
+            seq_len=seq_len,
+            d_model=64,
+            vocab_size=vocab_size,
+            num_layers=2,
+            num_heads=8,
+            dropout=0.1,
+            use_hankel_L=False,
+            use_tensordot=False,
+            device=device,
+        ).to(device)
+        models_to_train.append(("FlashSTU", flash_stu))
 
-    # Plot training loss for both models
-    ax1.plot(
-        loss_history_trans,
-        label="Transformer",
-        marker="o",
-        markersize=4,
-        linestyle="-",
-        linewidth=1,
-        color="blue",
-    )
-    ax1.plot(
-        loss_history_spectron,
-        label="Spectron",
-        marker="s",
-        markersize=4,
-        linestyle="-",
-        linewidth=1,
-        color="green",
-    )
-    ax1.set_xlabel("Step", fontsize=12)
-    ax1.set_ylabel("Cross-Entropy Loss", fontsize=12)
-    ax1.set_title("Training Loss", fontsize=14)
-    ax1.legend(fontsize=10)
-    ax1.grid(True)
+    if args.model == "all" or args.model == "mamba":
+        mamba = MambaModel(
+            seq_len=seq_len,
+            d_model=64,
+            vocab_size=vocab_size,
+            num_layers=2,
+            device=device,
+        ).to(device)
+        models_to_train.append(("Mamba", mamba))
 
-    # Plot validation accuracy for both models
-    ax2.plot(
-        eval_steps_trans,
-        acc_history_trans,
-        label="Transformer",
-        marker="o",
-        markersize=4,
-        linestyle="-",
-        linewidth=1,
-        color="blue",
-    )
-    ax2.plot(
-        eval_steps_spectron,
-        acc_history_spectron,
-        label="Spectron",
-        marker="s",
-        markersize=4,
-        linestyle="-",
-        linewidth=1,
-        color="green",
-    )
-    ax2.set_xlabel("Step", fontsize=12)
-    ax2.set_ylabel("Token-Level Accuracy (%)", fontsize=12)
-    ax2.set_title("Validation Accuracy Over Time (Token-Level)", fontsize=14)
-    ax2.legend(fontsize=10)
-    ax2.grid(True)
+    # Train models and collect results
+    results = {}
+    for model_name, model in models_to_train:
+        print(f"\nTraining {model_name}...")
+        loss_history, acc_history, eval_steps = train_model(
+            model, loader, val_loader, attn_mask=None, max_steps=args.steps, eval_interval=args.eval
+        )
+        results[model_name] = (loss_history, acc_history, eval_steps)
 
-    # Update final accuracy text to include both models
-    final_acc_text = (
-        f"Final Accuracy:\nTransformer: {acc_history_trans[-1]:.2f}%\nSpectron: {acc_history_spectron[-1]:.2f}%"
-    )
-    props = dict(boxstyle="round", facecolor="wheat", alpha=0.5)
-    ax2.text(0.05, 0.95, final_acc_text, transform=ax2.transAxes, fontsize=12, verticalalignment="top", bbox=props)
-    plt.tight_layout()
-    plt.show()
+        # Show example predictions after training
+        print(f"\n--- Example Predictions for {model_name} ---")
+        show_example_predictions(model, model_name, attn_mask=None)
 
-    # Example predictions.
-    def show_example_predictions(model, model_name: str, attn_mask=None):
-        model.eval()
-        with torch.no_grad():
-            first_input, first_target = train_dataset[0]
-            last_input, last_target = train_dataset[-1]
-            first_input = first_input.unsqueeze(0).to(device)
-            last_input = last_input.unsqueeze(0).to(device)
-            if isinstance(model, TransformerCopyModel):
-                first_logits = model(first_input, mask=attn_mask)
-                last_logits = model(last_input, mask=attn_mask)
-            elif isinstance(model, Spectron):
-                first_logits = model(first_input)
-                last_logits = model(last_input)
-            else:
-                first_logits, _ = model(first_input, attn_mask)
-                last_logits, _ = model(last_input, attn_mask)
-            target_seq_len = first_target.size(0)
-            # Shift logits by 1 to drop BOS so that predictions align with target.
-            first_logits = first_logits[:, 1 : 1 + target_seq_len, :]
-            last_logits = last_logits[:, 1 : 1 + target_seq_len, :]
-            first_pred = first_logits.argmax(dim=-1).squeeze(0).cpu()
-            last_pred = last_logits.argmax(dim=-1).squeeze(0).cpu()
-            print(f"\n{model_name} - First Example")
-            print("Input:     ", train_dataset[0][0].cpu().tolist())
-            print("Target:    ", first_target.cpu().tolist())
-            print("Predicted: ", first_pred.tolist())
-            print(f"\n{model_name} - Last Example")
-            print("Input:     ", train_dataset[-1][0].cpu().tolist())
-            print("Target:    ", last_target.cpu().tolist())
-            print("Predicted: ", last_pred.tolist())
+    # Only plot if we trained more than one model
+    if len(models_to_train) > 1:
+        plt.style.use("seaborn-v0_8-darkgrid")
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-    print("\n--- Predictions from Spectron (v1) ---")
-    show_example_predictions(spectron, "Spectron")
+        colors = {"Transformer": "blue", "Spectron": "green", "FlashSTU": "purple", "Mamba": "orange"}
+        markers = {"Transformer": "o", "Spectron": "s", "FlashSTU": "d", "Mamba": "x"}
+
+        # Plot training loss
+        for model_name, (loss_history, _, _) in results.items():
+            ax1.plot(loss_history, label=model_name, color=colors[model_name], alpha=0.7)
+        ax1.set_xlabel("Step")
+        ax1.set_ylabel("Cross-Entropy Loss")
+        ax1.set_title("Training Loss")
+        ax1.legend()
+        ax1.grid(True)
+
+        # Plot validation accuracy
+        for model_name, (_, acc_history, eval_steps) in results.items():
+            ax2.plot(eval_steps, acc_history, label=model_name, color=colors[model_name], marker=markers[model_name])
+        ax2.set_xlabel("Step")
+        ax2.set_ylabel("Token-Level Accuracy (%)")
+        ax2.set_title("Validation Accuracy")
+        ax2.legend()
+        ax2.grid(True)
+
+        # Add final accuracy text box
+        final_acc_text = "Final Accuracy:\n" + "\n".join(
+            f"{name}: {results[name][1][-1]:.2f}%" for name in results.keys()
+        )
+        props = dict(boxstyle="round", facecolor="wheat", alpha=0.5)
+        ax2.text(1.05, 0.95, final_acc_text, transform=ax2.transAxes, fontsize=10, verticalalignment="top", bbox=props)
+
+        plt.tight_layout()
+        plt.show()

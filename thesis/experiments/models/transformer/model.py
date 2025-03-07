@@ -104,7 +104,7 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(h_dim, dim, bias=bias, dtype=dtype)
 
     def forward(self, x):
-        return self.w2(F.silu(self.w(x)) * self.v(x))
+        return self.w2(F.gelu(self.w(x), approximate="tanh") * self.v(x))
 
 
 class Attention(nn.Module):
@@ -216,9 +216,8 @@ class FlexAttention(nn.Module):
         self.wv = nn.Linear(config.dim, config.dim)
 
         self.c_proj = nn.Linear(config.dim, config.dim)
-        self.c_proj.SCALE_INIT = 1
 
-    # TODO: Move this to generate.py (BlockMask to be generated dynamically)
+    # TODO: Is this useful?
     def _get_mask_mod(mask_mod: _mask_mod_signature, offset: int):
         def _mask_mod(b, h, q, kv):
             return mask_mod(b, h, q + offset, kv)
@@ -258,7 +257,6 @@ class FlexAttention(nn.Module):
         output = output.reshape(bsz, q_len, -1)
         output = self.c_proj(output)
         return output
-
 
 class AttentionLayer(nn.Module):
     def __init__(self, config, mask_mod=causal_mask) -> None:

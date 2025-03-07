@@ -26,7 +26,7 @@ def generate_copy(
     selective: bool = False,
     one_hot: bool = True,
     seed: int = 1746,
-    dtype: str | torch.dtype = torch.bfloat16,
+    dtype: str | torch.dtype = torch.float32,
 ) -> TensorDataset:
     """
     Generate a copy task dataset using explicit special tokens.
@@ -243,7 +243,7 @@ def get_hankel(seq_len: int, use_hankel_L: bool = False, device=None) -> torch.T
 
 
 def get_spectral_filters(
-    seq_len: int, K: int, use_hankel_L: bool = False, device: torch.device = None, dtype: torch.dtype = torch.bfloat16
+    seq_len: int, K: int, use_hankel_L: bool = False, device: torch.device = None, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     Z = get_hankel(seq_len, use_hankel_L).to(device)
     sigma, phi = torch.linalg.eigh(Z)
@@ -263,6 +263,7 @@ class LearnableSpectralFilters(nn.Module):
     def forward(self):
         return self.filters
 
+
 class SpectralAttention(nn.Module):
     def __init__(self, seq_len: int, d_model: int, k: int, use_hankel_L: bool = False, device=None):
         super().__init__()
@@ -280,18 +281,18 @@ class SpectralAttention(nn.Module):
         self.decay = nn.Parameter(torch.ones(seq_len, device=device))
         # Hankel matrix L (shape: [T, T]); we'll mask it to be lower-triangular.
         self.L = nn.Parameter(get_hankel(seq_len, use_hankel_L, device))
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, d = x.shape
         x_proj = self.pre_proj(x)  # (B, T, seq_len)
 
         # Compute Q: (B, T, k)
         Q = self.q_proj(x_proj)
-        
+
         # Compute K and V: (B, T, k)
         K = torch.einsum("bti,ik->btk", x_proj, self.K())
         V = torch.einsum("bti,ik->btk", x_proj, self.V())
-        
+
         # Compute Z as the outer product between V and K per time step,
         # scaled by the decay factor. In our notation:
         #   V: (B, T, k) with indices "btp"
@@ -299,21 +300,21 @@ class SpectralAttention(nn.Module):
         #   decay: (T,) with index "t"
         # Result Z: (B, T, k, k)
         Z = torch.einsum("btp,btn,t->btpn", V, K, self.decay)
-        
+
         # Prepare the Hankel mask: force L to be lower-triangular and reshape to (1, T, T)
         # so it broadcasts over batch.
         L_masked = torch.tril(self.L).unsqueeze(0)  # (1, T, T)
-        
+
         # Aggregate Z over time using L_masked.
         # Here we interpret L_masked as weighting contributions from all time steps s to output time t.
         # That is, for each b, t, p, n:
         #    H[b,t,p,n] = sum_s L_masked[0,t,s] * Z[b,s,p,n]
         H = torch.einsum("bts,bspn->btpn", L_masked, Z)
-        
+
         # Query the aggregated result with Q.
         # Q: (B, T, k), H: (B, T, k, k) → Y: (B, T, k)
         Y = torch.einsum("btk,btkn->btn", Q, H)
-        
+
         return self.o_proj(Y)
 
 
@@ -467,7 +468,7 @@ if __name__ == "__main__":
 
     # TransformerCopyModel
     trans_copy_model = TransformerCopyModel(
-        seq_len=input_seq_len, d_model=64, vocab_size=vocab_size, num_layers=2, num_heads=4, dropout=0.1
+        seq_len=input_seq_len, d_model=64, vocab_size=vocab_size, num_layers=2, num_heads=8, dropout=0.0
     ).to(device)
     compiled_trans_model = torch.compile(trans_copy_model, fullgraph=True)
     print("\nTraining TransformerCopyModel...")
@@ -485,7 +486,7 @@ if __name__ == "__main__":
         d_out=(vocab_size + 4),
         use_hankel_L=False,
         device=device,
-    ).to(device=device, dtype=torch.bfloat16)
+    ).to(device=device, dtype=torch.float32)
     compiled_spectron = torch.compile(spectron, fullgraph=True)
     loss_history_spectron, acc_history_spectron, eval_steps_spectron = train_model(
         compiled_spectron, loader, val_loader, max_steps=10000, eval_interval=10000

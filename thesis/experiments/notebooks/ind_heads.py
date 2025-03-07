@@ -343,7 +343,7 @@ causal_mask = build_causal_mask(64).to(device)
 # -----------------------------------------------------------------------------
 print("\nTraining TransformerInductionModel...")
 trans_induction_model = TransformerInductionModel(
-    seq_len=64, d_model=32, vocab_size=64, num_layers=2, num_heads=4, dropout=0.1
+    seq_len=64, d_model=32, vocab_size=64, num_layers=2, num_heads=8, dropout=0.1
 ).to(device)
 loss_history_transformer = train_model(trans_induction_model, loader, attn_mask=causal_mask, epochs=100)
 

@@ -43,18 +43,22 @@ from thesis.distributed.parallelisms import models_pipelining_fns, models_parall
 from thesis.distributed.float8 import Float8Handler
 from thesis.models import models_config, model_name_to_cls
 
+
 # TODO: put this somewhere else
-def linear_decay_with_warmup( # https://arxiv.org/pdf/2310.07831
-    current_step: int, 
-    warmup_steps: int, 
-    num_steps: int, 
-    max_lr: float = 3e-4, 
-    min_lr: float = 3e-5,
+def linear_decay_with_warmup(  # https://arxiv.org/pdf/2310.07831
+    current_step: int,
+    warmup_steps: int,
+    num_steps: int,
+    max_lr: float = 3e-4,
+    min_lr: float = 1e-4,
 ) -> float:
     if current_step < warmup_steps:
         return min_lr + (max_lr - min_lr) * float(current_step) / float(max(warmup_steps, 1))
     else:
-        return max_lr - (max_lr - min_lr) * float(current_step - warmup_steps) / float(max(num_steps - warmup_steps, 1))
+        return max_lr - (max_lr - min_lr) * float(current_step - warmup_steps) / float(
+            max(num_steps - warmup_steps, 1)
+        )
+
 
 try:
     from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss as CrossEntropyLoss
@@ -94,7 +98,7 @@ def main(job_config: JobConfig):
 
     # Initialize device memory monitor and get peak FLOPs for MFU calculations
     device_memory_monitor = build_device_memory_monitor()
-    gpu_peak_flops = get_peak_flops(device_memory_monitor.device_name) # TODO: Incorporate GPU memory monitor
+    gpu_peak_flops = get_peak_flops(device_memory_monitor.device_name)  # TODO: Incorporate GPU memory monitor
     logger.info(f"Peak FLOPs for MFU calculations: {gpu_peak_flops:.3e}")
 
     # Build meshes
@@ -341,7 +345,7 @@ def main(job_config: JobConfig):
 
     # Number of gradient accumulation steps to reach `global_bsz` tokens each update
     grad_accum_steps = desired_tokens_per_step // tokens_per_step
-    
+
     # Current gradient accumulating step (restore from checkpoint else 0)
     train_state.accum_step = train_state.accum_step or 0
 
@@ -388,16 +392,16 @@ def main(job_config: JobConfig):
                 optimizers.zero_grad()
 
             train_state.accum_step += 1
-            
+
             # Some technical state variables
             accum_steps_left_in_cycle = grad_accum_steps - train_state.accum_step
-            steps_left_in_training   = training_steps - train_state.step
+            steps_left_in_training = training_steps - train_state.step
             current_accum_target = min(accum_steps_left_in_cycle, steps_left_in_training)
             should_sync = (train_state.accum_step == current_accum_target) or is_last_step
 
             # Time the dataloading latency
             data_load_start = time.perf_counter()
-            batch = next(data_iterator) # TODO: Ensure that for each new epoch, we shuffle the data or something
+            batch = next(data_iterator)  # TODO: Ensure that for each new epoch, we shuffle the data or something
             data_loading_times.append(time.perf_counter() - data_load_start)
             inputs, targets = batch
             num_toks_since_last_log += targets.numel()
@@ -410,10 +414,11 @@ def main(job_config: JobConfig):
                 model.set_requires_gradient_sync(should_sync)
 
             # Create context/sequence parallelism context, if enabled
-            maybe_context_parallel = ( # TODO: Log and disable if model doesn't have any attention in it for now.
+            maybe_context_parallel = (  # TODO: Log and disable if model doesn't have any attention in it for now.
                 create_context_parallel_ctx(
                     cp_mesh=world_mesh["cp"],
-                    cp_buffers=[inputs, targets] + [m.freqs_cis for m in model_parts],  # TODO: We do not have RoPE in Flash STU...?
+                    cp_buffers=[inputs, targets]
+                    + [m.freqs_cis for m in model_parts],  # TODO: We do not have RoPE in Flash STU...?
                     cp_seq_dims=[1, 1] + [0 for _ in model_parts],
                     cp_no_restore_buffers={inputs, targets},
                     cp_rotate_method=getattr(job_config.distributed, "parallelism.context_parallel_rotate_method"),
@@ -423,7 +428,7 @@ def main(job_config: JobConfig):
             )
 
             # PP path (NOTE: bwd pass is computed within step() here)
-            if parallel_dims.pp_enabled:  
+            if parallel_dims.pp_enabled:
                 is_first_stage = pp_mesh.get_local_rank() == 0
                 is_last_stage = pp_mesh.get_local_rank() == pp_mesh.size() - 1
 
@@ -445,7 +450,7 @@ def main(job_config: JobConfig):
                     if is_last_stage
                     else torch.tensor([-1.0], device=device)
                 )
-            else: # Non-PP path
+            else:  # Non-PP path
                 with train_context(maybe_context_parallel):
                     preds = model(inputs)
                     loss = loss_fn(preds, targets) / current_accum_target
@@ -457,7 +462,7 @@ def main(job_config: JobConfig):
             # TODO: Need to add validation loader somewhere
 
             if parallel_dims.pp_enabled:
-                loss_for_logging = loss.detach() # Bwd pass already done, so we don't rescale
+                loss_for_logging = loss.detach()  # Bwd pass already done, so we don't rescale
             else:
                 loss_for_logging = loss.detach() * grad_accum_steps
 
@@ -495,11 +500,7 @@ def main(job_config: JobConfig):
                 avg_loss = sum(loss_values) / len(loss_values)
                 max_loss = max(loss_values)
 
-                if (
-                    parallel_dims.dp_replicate_enabled
-                    or parallel_dims.dp_shard_enabled
-                    or parallel_dims.cp_enabled
-                ):
+                if parallel_dims.dp_replicate_enabled or parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
                     avg_loss, max_loss = (
                         dist_mean(avg_loss, world_mesh["dp_cp"]),
                         dist_max(max_loss, world_mesh["dp_cp"]),

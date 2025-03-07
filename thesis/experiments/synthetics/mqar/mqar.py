@@ -134,9 +134,6 @@ from torch.utils.data import TensorDataset
 
 #     return TensorDataset(inputs, targets)
 
-import torch
-from torch.utils.data import TensorDataset
-
 def generate_mqar(
     num_examples: int = 100000,
     sequence_len: int = 512,

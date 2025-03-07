@@ -3,8 +3,10 @@ from torch.utils.data import TensorDataset
 import numpy as np
 from typing import Tuple
 
+
 def exists(obj):
     return obj is not None and obj != ""
+
 
 def generate_copying(
     vocab_size: int = 16,
@@ -39,10 +41,9 @@ def generate_copying(
     if not exists(rng):
         rng = np.random.default_rng()
 
-    # Define special tokens:
-    copy_token = vocab_size - 1  # highest index
-    blank_token = vocab_size - 2  # second-highest index
-    # Regular tokens: 0 to (vocab_size - 3)
+    # Define special tokens and validate sequence length
+    copy_token = vocab_size - 1
+    blank_token = vocab_size - 2
     non_special_vocab_size = vocab_size - 2
     vocab = np.arange(non_special_vocab_size)
 

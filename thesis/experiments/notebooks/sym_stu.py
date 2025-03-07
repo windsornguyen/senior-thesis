@@ -331,7 +331,7 @@ def symmetric_outer(V: torch.Tensor) -> torch.Tensor:
     scale = torch.where(
         indices[0] == indices[1],
         torch.tensor(1.0, device=V.device, dtype=V.dtype),
-        torch.tensor(math.sqrt(2.0), device=V.device, dtype=V.dtype)
+        torch.tensor(math.sqrt(2.0), device=V.device, dtype=V.dtype),
     )
     Z = Z * scale
     return Z
@@ -549,7 +549,7 @@ if __name__ == "__main__":
     #     d_model=128,  # Increased model capacity
     #     vocab_size=vocab_size,
     #     num_layers=3,  # Increased depth
-    #     num_heads=4,
+    #     num_heads=8,
     #     dropout=0.1,
     # ).to(device)
     # compiled_trans_model = torch.compile(trans_copy_model, fullgraph=True)

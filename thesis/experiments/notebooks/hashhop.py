@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
+
 # === Simple Character-level Tokenizer and Helpers ===
 def build_char_tokenizer() -> Dict[str, int]:
     # Define a fixed vocabulary: letters, digits, punctuation, space and newline.
@@ -23,23 +24,28 @@ def build_char_tokenizer() -> Dict[str, int]:
     # Reserve index 0 for padding.
     return {ch: i + 1 for i, ch in enumerate(vocab)}
 
+
 def encode_text(text: str, token2idx: Dict[str, int]) -> List[int]:
     return [token2idx.get(ch, 0) for ch in text]
+
 
 def pad_sequences(seq_list: List[List[int]], pad_value: int = 0) -> torch.Tensor:
     max_len = max(len(seq) for seq in seq_list)
     padded = [seq + [pad_value] * (max_len - len(seq)) for seq in seq_list]
     return torch.tensor(padded, dtype=torch.long)
 
+
 # === Prompt Templates and Data Structures ===
 TASK_PROMPT_TEMPLATE = "{VARIABLE_LIST}"
 COMPLETION_TEMPLATE = "HOPS={HOPS}\nCoT={COT}\n{COMPLETION}"
+
 
 @dataclass
 class MultiHopSample:
     prompt: str
     completion: str
     targets: Dict[str, str]
+
 
 # === Multi-Hop Evaluation Generator (unchanged) ===
 class MultiHopEval:
@@ -88,7 +94,9 @@ class MultiHopEval:
         random.shuffle(lines)
         all_query_strings = shuffle_dict(all_query_strings)
 
-        assert num_queries <= len(all_query_strings), f"Requested {num_queries} queries, but only {len(all_query_strings)} available."
+        assert num_queries <= len(
+            all_query_strings
+        ), f"Requested {num_queries} queries, but only {len(all_query_strings)} available."
 
         completion = COMPLETION_TEMPLATE.format(
             COMPLETION="\n".join([f"{k} = '{v}'" for k, v in list(all_query_strings.items())[:num_queries]]),
@@ -108,14 +116,17 @@ class MultiHopEval:
             levels.append({v: make_random_string(length=string_length) for v in levels[-1].values()})
         return levels
 
+
 def make_random_string(length: int) -> str:
     alphabet = string.ascii_lowercase + string.ascii_uppercase
     return "".join(random.choices(alphabet, k=length))
+
 
 def shuffle_dict(to_shuffle: dict) -> dict:
     items = list(to_shuffle.items())
     random.shuffle(items)
     return dict(items)
+
 
 # === HashHop Dataset Generation ===
 def generate_hashhop_dataset(
@@ -153,6 +164,7 @@ def generate_hashhop_dataset(
 
     return TensorDataset(inputs_tensor, targets_tensor), token2idx
 
+
 # === Build a Seq2Seq Dataset by Concatenating Prompt and Completion ===
 def generate_hashhop_seq2seq_dataset(
     num_examples: int,
@@ -185,10 +197,12 @@ def generate_hashhop_seq2seq_dataset(
     targets_tensor = pad_sequences(new_targets, pad_value=0)
     return TensorDataset(inputs_tensor, targets_tensor), token2idx
 
+
 # === Helper: Build Causal Mask (for decoder) ===
 def build_causal_mask(seq_len: int) -> torch.Tensor:
-    mask = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
+    mask = torch.triu(torch.full((seq_len, seq_len), float("-inf")), diagonal=1)
     return mask
+
 
 # === Custom Transformer Components (as before) ===
 class CustomMultiHeadAttention(nn.Module):
@@ -224,6 +238,7 @@ class CustomMultiHeadAttention(nn.Module):
         output = self.out_proj(attn_output)
         return output, attn_weights
 
+
 class CustomTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1, dim_feedforward: int = None):
         super().__init__()
@@ -247,18 +262,19 @@ class CustomTransformerEncoderLayer(nn.Module):
         src = self.norm2(src)
         return src
 
+
 class CustomTransformerEncoder(nn.Module):
     def __init__(self, d_model: int, num_heads: int, num_layers: int, dropout: float = 0.1):
         super().__init__()
-        self.layers = nn.ModuleList([
-            CustomTransformerEncoderLayer(d_model, num_heads, dropout=dropout)
-            for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [CustomTransformerEncoderLayer(d_model, num_heads, dropout=dropout) for _ in range(num_layers)]
+        )
 
     def forward(self, src: torch.Tensor, mask: torch.Tensor = None):
         for layer in self.layers:
             src = layer(src, mask=mask)
         return src
+
 
 # === Spectral Filters and Spectral Attention (DO NOT ALTER) ===
 def get_monic_chebyshev_coeffs(n: int) -> torch.Tensor:
@@ -276,10 +292,12 @@ def get_monic_chebyshev_coeffs(n: int) -> torch.Tensor:
             T2 = [a - b for a, b in zip(T2, padded_T0)]
             T0, T1 = T1, T2
         return T2
+
     coeffs = torch.tensor(chebyshev_t_int(n), dtype=torch.complex128)
     if n > 0:
         coeffs = coeffs / (2.0 ** (n - 1))
     return coeffs
+
 
 def get_hankel(seq_len: int, use_hankel_L: bool = False, device=None) -> torch.Tensor:
     entries = torch.arange(1, seq_len + 1, dtype=torch.float32, device=device)
@@ -292,7 +310,10 @@ def get_hankel(seq_len: int, use_hankel_L: bool = False, device=None) -> torch.T
         Z = 2.0 / (i_plus_j**3 - i_plus_j)
     return Z
 
-def get_spectral_filters(seq_len: int, K: int, use_hankel_L: bool = False, device: torch.device = None, dtype=torch.float32) -> torch.Tensor:
+
+def get_spectral_filters(
+    seq_len: int, K: int, use_hankel_L: bool = False, device: torch.device = None, dtype=torch.float32
+) -> torch.Tensor:
     Z = get_hankel(seq_len, use_hankel_L, device)
     sigma, phi = torch.linalg.eigh(Z)
     sigma_k, phi_k = sigma[-K:], phi[:, -K:]
@@ -301,13 +322,16 @@ def get_spectral_filters(seq_len: int, K: int, use_hankel_L: bool = False, devic
     phi_k = phi_k * sigma_k**0.25
     return phi_k.to(device=device, dtype=dtype)
 
+
 class LearnableSpectralFilters(nn.Module):
     def __init__(self, seq_len: int, k: int, use_hankel_L: bool = False, device=None, dtype=torch.float32):
         super().__init__()
         filters = get_spectral_filters(seq_len, k, use_hankel_L, device, dtype)
         self.filters = nn.Parameter(filters)
+
     def forward(self):
         return self.filters
+
 
 class SpectralAttention(nn.Module):
     def __init__(self, seq_len: int, d_model: int, k: int, use_hankel_L: bool = False, device=None):
@@ -334,9 +358,18 @@ class SpectralAttention(nn.Module):
         Y = torch.einsum("btk,btkn->btn", Q, H)
         return self.o_proj(Y)
 
+
 # === Seq2Seq Models for HashHop Task ===
 class TransformerHashHopModel(nn.Module):
-    def __init__(self, seq_len: int, d_model: int, vocab_size: int, num_layers: int = 2, num_heads: int = 2, dropout: float = 0.1):
+    def __init__(
+        self,
+        seq_len: int,
+        d_model: int,
+        vocab_size: int,
+        num_layers: int = 2,
+        num_heads: int = 2,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         # Note: vocab_size here should equal len(token2idx)+1.
         self.seq_len = seq_len
@@ -351,6 +384,7 @@ class TransformerHashHopModel(nn.Module):
         logits = self.out_proj(enc_out)  # (B, T, vocab_size)
         return logits
 
+
 class SpectronHashHop(nn.Module):
     def __init__(self, seq_len: int, d_model: int, k: int, vocab_size: int, use_hankel_L: bool = False, device=None):
         super().__init__()
@@ -364,6 +398,7 @@ class SpectronHashHop(nn.Module):
         out = x_emb + self.spec_attn(x_emb)
         logits = self.out_proj(out)
         return logits
+
 
 # === Training Loop for Seq2Seq HashHop Task with Loss Recording ===
 def train_model(model, loader, attn_mask=None, epochs: int = 5):
@@ -386,20 +421,22 @@ def train_model(model, loader, attn_mask=None, epochs: int = 5):
         print(f"Epoch {epoch+1}/{epochs} Loss: {epoch_loss:.4f}")
     return loss_history
 
+
 # === Helper: Decode tokens back to text ===
 def decode_tokens(token_ids: List[int], idx2token: Dict[int, str]) -> str:
     # Skip pad (0) and ignore (-1)
     return "".join([idx2token.get(t, "") for t in token_ids if t > 0])
 
+
 # === Build the Seq2Seq HashHop Dataset ===
 dataset, token2idx = generate_hashhop_seq2seq_dataset(
-    num_examples=100, 
-    n_chars_problem=300, 
-    num_queries=3, 
-    hops=3, 
-    hash_pair_str_length=4, 
-    chain_of_thought=True, 
-    seed=1746
+    num_examples=100,
+    n_chars_problem=300,
+    num_queries=3,
+    hops=3,
+    hash_pair_str_length=4,
+    chain_of_thought=True,
+    seed=1746,
 )
 loader = DataLoader(dataset, batch_size=8, shuffle=True)
 
@@ -414,11 +451,15 @@ causal_mask = build_causal_mask(seq_len).to(device)
 # === Instantiate & Train Models ===
 print("\nTraining TransformerHashHopModel...")
 vocab_size = len(token2idx) + 1  # tokens from 0 to len(token2idx)
-trans_model = TransformerHashHopModel(seq_len=seq_len, d_model=64, vocab_size=vocab_size, num_layers=2, num_heads=4, dropout=0.1).to(device)
+trans_model = TransformerHashHopModel(
+    seq_len=seq_len, d_model=64, vocab_size=vocab_size, num_layers=2, num_heads=8, dropout=0.1
+).to(device)
 loss_history_trans = train_model(trans_model, loader, attn_mask=causal_mask, epochs=10)
 
 print("\nTraining SpectronHashHop...")
-spectron_model = SpectronHashHop(seq_len=seq_len, d_model=64, k=16, vocab_size=vocab_size, use_hankel_L=False, device=device).to(device)
+spectron_model = SpectronHashHop(
+    seq_len=seq_len, d_model=64, k=16, vocab_size=vocab_size, use_hankel_L=False, device=device
+).to(device)
 loss_history_spectron = train_model(spectron_model, loader, epochs=10)
 
 # === Plot Training Loss for the HashHop Task ===
@@ -432,6 +473,7 @@ plt.legend(fontsize=10)
 plt.grid(True)
 plt.tight_layout()
 plt.show()
+
 
 # === Display Example Predictions ===
 def show_example_predictions(model, model_name: str, attn_mask=None):
@@ -449,6 +491,7 @@ def show_example_predictions(model, model_name: str, attn_mask=None):
         target_decoded = decode_tokens([t for t in target_seq if t != -1], idx2token)
         print("Target:   ", target_decoded)
         print("Predicted:", decode_tokens(pred_seq, idx2token))
+
 
 print("\n--- Predictions from TransformerHashHopModel ---")
 show_example_predictions(trans_model, "TransformerHashHopModel", attn_mask=causal_mask)

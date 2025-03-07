@@ -11,7 +11,7 @@ bias: false
 dropout: 0.0
 num_eigh: 24
 use_hankel_L: false
-use_approx: true
+use_tensordot: true
 dtype: bfloat16
 
 # Derived attributes
