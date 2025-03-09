@@ -10,127 +10,62 @@ from tqdm import tqdm
 
 from thesis.experiments.synthetics.icr import generate_icr
 from thesis.experiments.synthetics.args import args
+from flash_attn import flash_attn_func
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 torch.set_float32_matmul_precision("high")
 
 
-class CustomMultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.0):
-        super().__init__()
-        if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads")
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.scale = math.sqrt(self.head_dim)
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
+def precompute_freqs_cis(head_dim: int, max_seq_len: int, theta: float = 10000.0):    
+    # For half the dimensions, build the scale factor:
+    freq_seq = torch.arange(0, head_dim, 2).float() / head_dim
+    freqs = 1.0 / (theta ** freq_seq)
 
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor = None):
-        B, T, _ = query.shape
-        Q = self.q_proj(query)
-        K = self.k_proj(key)
-        V = self.v_proj(value)
-        Q = Q.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+    # Outer product with positions
+    t = torch.arange(max_seq_len, dtype=torch.float32)
+    angles = torch.outer(t, freqs)
 
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-
-        if mask is not None:
-            mask = mask.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, -1, -1)
-            attn_scores = attn_scores + mask
-
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        attn_output = torch.matmul(attn_weights, V)
-        attn_output = attn_output.transpose(1, 2).reshape(B, T, self.d_model)
-        output = self.out_proj(attn_output)
-        return output, attn_weights
+    # Build a complex exponential e^{i * theta}
+    freqs_cis = torch.polar(
+        torch.ones_like(angles),
+        angles
+    )
+    return freqs_cis
 
 
-class CustomTransformerEncoderLayer(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1, dim_feedforward: int = None):
-        super().__init__()
-        if dim_feedforward is None:
-            dim_feedforward = 4 * d_model
-        self.self_attn = CustomMultiHeadAttention(d_model, num_heads, dropout=dropout)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(self, src: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        attn_out, _ = self.self_attn(src, src, src, mask=mask)
-        src = src + self.dropout1(attn_out)
-        src = self.norm1(src)
-        ff_out = self.linear2(self.dropout(F.relu(self.linear1(src))))
-        src = src + self.dropout2(ff_out)
-        src = self.norm2(src)
-        return src
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    """
+    x is [B, n_heads, seq_len, head_dim_as_complex],
+    so we want to broadcast freqs_cis from [max_seq_len, half_dim]
+    to [1, 1, seq_len, half_dim].
+    """
+    seq_len = x.shape[2]
+    freqs_cis = freqs_cis[:seq_len]  # slice down to current seq_len
+    return freqs_cis.view(1, 1, seq_len, -1)
 
 
-class CustomTransformerEncoder(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, num_layers: int, dropout: float = 0.1):
-        super().__init__()
-        self.layers = nn.ModuleList(
-            [CustomTransformerEncoderLayer(d_model, num_heads, dropout=dropout) for _ in range(num_layers)]
-        )
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Convert real -> complex by grouping last dim in pairs
+    # shape => [B, n_heads, seq_len, head_dim//2, 2] => complex => [B, n_heads, seq_len, head_dim//2]
+    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
 
-    def forward(self, src: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        for layer in self.layers:
-            src = layer(src, mask=mask)
-        return src
+    # Broadcast the frequencies to match [B, n_heads, seq_len, head_dim//2]
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_complex)
 
+    # Multiply => apply rotation
+    xq_complex = xq_complex * freqs_cis
+    xk_complex = xk_complex * freqs_cis
 
-class TransformerRecallModel(nn.Module):
-    def __init__(
-        self,
-        seq_len: int,
-        d_model: int,
-        vocab_size: int,
-        num_layers: int = 2,
-        num_heads: int = 4,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.seq_len = seq_len
-        # Create sinusoidal positional embeddings
-        position = torch.arange(seq_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(seq_len, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
-
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.encoder = CustomTransformerEncoder(d_model, num_heads, num_layers, dropout)
-        self.out_proj = nn.Linear(d_model, vocab_size)
-
-        # Create and register causal mask buffer
-        causal_mask = torch.triu(torch.full((seq_len, seq_len), float("-inf")), diagonal=1)
-        self.register_buffer("causal_mask", causal_mask)
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        x_embed = self.embedding(x) + self.pe.unsqueeze(0)
-        mask = mask if mask is not None else self.causal_mask
-        enc_out = self.encoder(x_embed, mask=mask)
-        logits = self.out_proj(enc_out)
-        return logits
-
-
-# -----------------------------------------------------------------------------
-# Spectral Components
-# -----------------------------------------------------------------------------
-
+    # Convert back to real => shape [B, n_heads, seq_len, head_dim]
+    xq_out = torch.view_as_real(xq_complex).reshape(*xq.shape)
+    xk_out = torch.view_as_real(xk_complex).reshape(*xk.shape)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 class MLP(nn.Module):
     """
@@ -167,6 +102,164 @@ class MLP(nn.Module):
         """
         return self.w2(F.gelu(self.w1(x), approximate="tanh") * self.w3(x))
 
+class Attention(nn.Module):
+    def __init__(self, args):
+        super(Attention, self).__init__()
+        self.dim, self.num_heads = args.dim, args.num_heads
+        assert args.dim % args.num_heads == 0, f"dim ({self.dim}) must be divisible num_heads ({self.num_heads})"
+        self.head_dim = args.dim // args.num_heads
+
+        self.wq = nn.Linear(args.dim, args.dim)
+        self.wk = nn.Linear(args.dim, args.dim)
+        self.wv = nn.Linear(args.dim, args.dim)
+
+        self.c_proj = nn.Linear(args.dim, args.dim, bias=args.bias)
+        self.c_proj.SCALE_INIT = 1
+
+        self.alibi_slopes = self._get_alibi_slopes(self.num_heads) if args.use_alibi else None
+        self.window_size = args.window_size
+        self.softcap = args.softcap
+
+        self.dropout = args.dropout
+        self.resid_dropout = nn.Dropout(self.dropout)
+
+    def _generate_slopes(self, n: int):
+            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+            return [start * (start**i) for i in range(n)]
+
+    def _get_alibi_slopes(self, num_heads: int, interpolation_factor: float = 0.25):
+        # If n_heads is a power of 2, generate slopes directly
+        if math.log2(num_heads).is_integer():
+            slopes = self._generate_slopes(num_heads)
+        else:
+            # Get slopes for the nearest power of two
+            n = nearest_power_of_two(num_heads, round_up=False)
+            slopes_power_of_two = self._generate_slopes(n)
+
+            # Generate extra slopes
+            extra_slopes = self._generate_slopes(2 * n)
+            extra_slopes_trunc = extra_slopes[0::2][: num_heads - n]
+            slopes = slopes_power_of_two + extra_slopes_trunc
+        slopes = torch.tensor(slopes, device=torch.device("cuda")) # FA ALiBi must be on CUDA
+        slopes = slopes * interpolation_factor  # https://arxiv.org/pdf/2310.13017
+        return slopes
+
+    def forward(
+        self,
+        x: torch.Tensor = None,
+        q: torch.Tensor = None,
+        k: torch.Tensor = None,
+        v: torch.Tensor = None,
+        freqs_cis: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if x is not None:
+            q = k = v = x
+        if any(t is None for t in [q, k, v]):
+            raise ValueError("Must provide either x for self-attention or q/k/v for cross-attention.")
+
+        bsz, q_len, dim = q.shape
+        _, k_len, _ = k.shape
+        _, v_len, _ = v.shape
+
+        q, k, v = self.wq(q), self.wk(k), self.wv(v)
+
+        # FlashAttention expects bsz, seq_len, num_heads, head_dim
+        q = q.view(bsz, q_len, self.num_heads, self.head_dim)
+        k = k.view(bsz, k_len, self.num_heads, self.head_dim)
+        v = v.view(bsz, v_len, self.num_heads, self.head_dim)
+
+        if self.alibi_slopes is None: # Either RoPE or ALiBi for positional embedding
+            q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)
+
+        y = flash_attn_func(  # https://arxiv.org/pdf/2307.08691
+            q=q, k=k, v=v,
+            dropout_p=self.dropout if self.training else 0.0,
+            causal=True,
+            # window_size=(self.window_size, 0), # Set to seq_len if full attention
+            # alibi_slopes=self.alibi_slopes, # https://arxiv.org/pdf/2108.12409
+
+            # NOTE: Softcapping cannot be used simultaneously with dropout
+            # softcap=self.softcap,  # https://arxiv.org/pdf/2408.00118
+        )
+
+        out = y.contiguous().view(bsz, q_len, -1)
+        out = self.resid_dropout(self.c_proj(out))
+        return out
+
+class AttentionLayer(nn.Module):
+    def __init__(self, args) -> None:
+        super(AttentionLayer, self).__init__()
+        self.attn_norm = nn.RMSNorm(args.dim)
+        self.attn = Attention(args=args)
+        self.mlp_norm = nn.RMSNorm(args.dim)
+        self.mlp = MLP(args.dim, args.mlp_scale * args.dim)
+
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor=None) -> torch.Tensor:
+        x = x + self.attn(x=self.attn_norm(x), freqs_cis=freqs_cis)
+        x = x + self.mlp(self.mlp_norm(x))
+        return x
+
+class Transformer(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.num_layers = args.num_layers
+        assert args.dim % args.num_heads == 0, f"dim ({args.dim}) must be divisible num_heads ({args.num_heads})"
+        self.head_dim = args.dim // args.num_heads
+
+        # From pytorch/pytorch#123411, we set persistent=True for torch.compile and PP compatibility
+        self.register_buffer(
+            "freqs_cis",
+            precompute_freqs_cis(
+                head_dim=self.head_dim,
+                max_seq_len=args.seq_len,
+                theta=args.theta,
+            ),
+            persistent=True,
+        )
+
+        self.tok_emb = nn.Embedding(args.vocab_size, args.dim)
+        self.dropout = nn.Dropout(args.dropout)
+
+        self.layers = nn.ModuleList()
+        for _ in range(args.num_layers):
+            self.layers.append(AttentionLayer(args))
+
+        self.out_norm = nn.RMSNorm(args.dim)
+        self.lm_head = nn.Linear(args.dim, args.vocab_size, bias=args.bias)
+        self.lm_head.SCALE_INIT = 1
+
+        if args.weight_tying:
+            self.tok_emb.weight = self.lm_head.weight
+
+        self.std = args.dim ** -0.5
+        self.apply(self._init_weights)
+        print("Model Parameter Count: %.2fM\n" % (self._get_num_params() / 1e6,))
+
+    def forward(self, x: torch.Tensor) -> torch.tensor:
+        tok_emb = self.tok_emb(x)
+        x = self.dropout(tok_emb)
+
+        for layer in self.layers:
+            x = layer(x, freqs_cis=self.freqs_cis)
+
+        out = self.lm_head(self.out_norm(x))
+        return out
+
+    def _get_num_params(self):
+        n_params = sum(p.numel() for p in self.parameters())
+        if hasattr(self, "pos_emb") and self.pos_emb is not None:
+            n_params -= self.pos_emb.weight.numel()
+        return n_params
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            if hasattr(module, "SCALE_INIT"):
+                self.std *= (2 * self.num_layers) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.std)
 
 def get_toeplitz(seq_len: int, device=None) -> torch.Tensor:
     entries = torch.arange(1, seq_len + 1, dtype=torch.float32, device=device)
@@ -174,7 +267,6 @@ def get_toeplitz(seq_len: int, device=None) -> torch.Tensor:
     j = entries[None, :]
     Z = 2.0 / ((i + j) ** 3 - (i - j))
     return Z
-
 
 def get_hankel(seq_len: int, use_hankel_L: bool = False, device=None) -> torch.Tensor:
     entries = torch.arange(1, seq_len + 1, dtype=torch.float32, device=device)
@@ -198,118 +290,6 @@ def get_spectral_filters(
     sigma_k = sigma_k.clamp_min(epsilon)
     phi_k = phi_k * sigma_k**0.25
     return phi_k.to(device=device, dtype=dtype)
-
-
-class LearnableSpectralFilters(nn.Module):
-    def __init__(
-        self, seq_len: int, k: int, use_hankel_L: bool = False, device=None, dtype: torch.dtype = torch.float32
-    ):
-        super().__init__()
-        filters = get_spectral_filters(seq_len, k, use_hankel_L, device, dtype)
-        self.filters = nn.Parameter(filters)
-
-    def forward(self):
-        return self.filters
-
-
-# class SpectralAttention(nn.Module):
-#     def __init__(self, seq_len: int, d_model: int, k: int, use_hankel_L: bool = False, device=None):
-#         super().__init__()
-#         self.seq_len = seq_len
-#         self.pre_proj = nn.Linear(d_model, seq_len) if d_model != seq_len else nn.Identity()
-#         self.q_proj = nn.Linear(seq_len, k).to(device)
-#         self.K = LearnableSpectralFilters(seq_len, k, use_hankel_L, device)
-#         self.V = LearnableSpectralFilters(seq_len, k, use_hankel_L, device)
-#         self.o_proj = nn.Linear(k, d_model).to(device)
-#         self.L = nn.Parameter(get_hankel(seq_len, device))
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         B, T, d = x.shape
-#         z = x
-#         x_proj = self.pre_proj(x)  # (B, T, seq_len)
-
-#         # Compute Q: (B, T, k)
-#         Q = self.q_proj(x_proj)
-
-#         # Compute K and V: (B, T, k)
-#         K = torch.einsum("bti,ik->btk", x_proj, self.K())
-#         V = torch.einsum("bti,ik->btk", x_proj, self.V())
-
-#         Z = torch.einsum("btp,btn->btpn", V, K)
-
-#         L_masked = torch.tril(self.L).unsqueeze(0)  # (1, T, T)
-
-#         H = torch.einsum("bts,bspn->btpn", L_masked, Z)
-#         Y = torch.einsum("btk,btkn->btn", Q, H)
-
-#         return z + self.o_proj(Y)
-
-
-# class SpectralAttentionLayer(nn.Module):
-#     """
-#     A single layer that applies SpectralAttention, followed by an MLP,
-#     each of which is added (residual) to the input, then normalized.
-
-#     Args:
-#         seq_len (int): Sequence length (T).
-#         d_model (int): Model dimension.
-#         k (int): Projection dimension for the spectral filters.
-#         use_hankel_L (bool): Whether to use a Hankel matrix.
-#         device: Torch device.
-#     """
-
-#     def __init__(self, seq_len: int, d_model: int, k: int, use_hankel_L: bool = False, device=None):
-#         super().__init__()
-#         self.spectral_attention = SpectralAttention(seq_len, d_model, k, use_hankel_L, device)
-#         self.mlp = MLP(d_model, 4 * d_model)
-#         self.spec_attn_norm = nn.RMSNorm(d_model)
-#         self.mlp_norm = nn.RMSNorm(d_model)
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         Forward pass of SpectralAttentionLayer.
-
-#         Args:
-#             x (torch.Tensor): Input tensor of shape (B, T, d_model).
-
-#         Returns:
-#             torch.Tensor: Output tensor of shape (B, T, d_model).
-#         """
-#         x = x + self.spectral_attention(self.spec_attn_norm(x))
-#         x = x + self.mlp(self.mlp_norm(x))
-#         return x
-
-# class Spectron(nn.Module):
-#     def __init__(
-#         self,
-#         seq_len: int,
-#         d_model: int,
-#         k: int,
-#         vocab_size: int,
-#         d_out: int = None,
-#         num_layers: int = 1,
-#         dropout: float = 0.1,
-#         use_hankel_L: bool = False,
-#         device=None,
-#     ):
-#         super().__init__()
-#         if d_out is None:
-#             d_out = vocab_size
-#         self.embedding = nn.Embedding(vocab_size, d_model)
-#         self.in_dropout = nn.Dropout(dropout)
-#         self.out_dropout = nn.Dropout(dropout)
-#         self.layers = nn.ModuleList(
-#             [SpectralAttentionLayer(seq_len, d_model, k, use_hankel_L, device) for _ in range(num_layers)]
-#         )
-#         self.norm = nn.LayerNorm(d_model)
-#         self.out_proj = nn.Linear(d_model, d_out)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         x_emb = self.in_dropout(self.embedding(x))
-#         out = x_emb
-#         for layer in self.layers:
-#             out = layer(out)
-#         out = self.norm(out)
-#         return self.out_dropout(self.out_proj(out))
 
 
 def get_opt_degree(seq_len: int) -> int:
@@ -519,7 +499,6 @@ class SpectralAttention(nn.Module):
 
         # Gate for combining attention and spectral features
         self.gate = nn.Linear(d_model, d_model, device=device, dtype=dtype)
-        self.leak = nn.Linear(d_model, d_model, device=device, dtype=dtype)
 
         # Normalization
         self.norm = nn.RMSNorm(d_model)
@@ -566,7 +545,6 @@ class SpectralAttention(nn.Module):
 
         # Branch 1: Compute STU features
         x_tilde = self.compute_stu_features(x)  # (B, T, d_model)
-        # x_tilde = F.gelu(self.leak(x), approximate="tanh")
 
         # Branch 2: Compute multihead linear attention
         Q = self.Q(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
@@ -593,7 +571,7 @@ class SpectralAttention(nn.Module):
         Y_combined = gate_values * Y_attn + (1 - gate_values) * x_tilde
 
         # Final projection and normalization
-        return self.norm(self.o_proj(Y_combined))  # This norm doesn't rly make sense but it helps?
+        return self.o_proj(Y_combined)  # This norm doesn't rly make sense but it helps?
 
 
 class SpectralAttentionLayer(nn.Module):
@@ -641,7 +619,7 @@ class SpectralAttentionLayer(nn.Module):
         """
         x = x + self.spectral_attention(self.spec_attn_norm(x))
         x = x + self.mlp(self.mlp_norm(x))
-        return self.norm(x)
+        return x
 
 
 class Spectron(nn.Module):
@@ -727,14 +705,6 @@ class Spectron(nn.Module):
         out = self.norm(out)
         out = self.out_proj(out)
         return self.out_dropout(out)
-
-
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange, repeat
-
 
 class DropoutNd(nn.Module):
     def __init__(self, p: float = 0.5, tie=True, transposed=True):
@@ -1010,7 +980,7 @@ class MambaModel(nn.Module):
 # -----------------------------------------------------------------------------
 # Training and Evaluation Functions
 # -----------------------------------------------------------------------------
-def compute_token_level_accuracy(model, loader, attn_mask=None, device=device):
+def compute_token_level_accuracy(model, loader, device=device):
     """
     Compute token-level accuracy while ignoring special tokens and target_ignore_idx.
     This is a general metric that considers all valid positions.
@@ -1021,7 +991,7 @@ def compute_token_level_accuracy(model, loader, attn_mask=None, device=device):
     with torch.no_grad():
         for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            logits = model(inputs, mask=attn_mask) if isinstance(model, TransformerRecallModel) else model(inputs)
+            logits = model(inputs)
             predictions = logits.argmax(dim=-1)
             valid_mask = targets != -100
             match = (predictions == targets) & valid_mask
@@ -1033,7 +1003,7 @@ def compute_token_level_accuracy(model, loader, attn_mask=None, device=device):
     return token_acc
 
 
-def compute_recall_accuracy(model, loader, attn_mask=None, device=device):
+def compute_recall_accuracy(model, loader, device=device):
     """
     Compute accuracy specifically on positions where we test key-value recall.
     These are positions where targets != -100 and we're testing if the model
@@ -1045,7 +1015,7 @@ def compute_recall_accuracy(model, loader, attn_mask=None, device=device):
     with torch.no_grad():
         for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            logits = model(inputs, mask=attn_mask) if isinstance(model, TransformerRecallModel) else model(inputs)
+            logits = model(inputs)
             predictions = logits.argmax(dim=-1)
 
             # Find positions where we're testing recall (targets != -100)
@@ -1061,7 +1031,7 @@ def compute_recall_accuracy(model, loader, attn_mask=None, device=device):
     return recall_acc
 
 
-def train_model(model, loader, val_loader, attn_mask=None, max_steps: int = 10000, eval_interval: int = 50):
+def train_model(model, loader, val_loader, max_steps: int = 10000, eval_interval: int = 50):
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     model.train()
@@ -1085,7 +1055,7 @@ def train_model(model, loader, val_loader, attn_mask=None, max_steps: int = 1000
             targets = targets.to(device)
 
             optimizer.zero_grad()
-            logits = model(inputs, mask=attn_mask) if isinstance(model, TransformerRecallModel) else model(inputs)
+            logits = model(inputs)
             loss = criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
             loss.backward()
             optimizer.step()
@@ -1099,7 +1069,7 @@ def train_model(model, loader, val_loader, attn_mask=None, max_steps: int = 1000
             pbar.update(1)
 
             if step % eval_interval == 0:
-                acc = compute_token_level_accuracy(model, val_loader, attn_mask=attn_mask)
+                acc = compute_token_level_accuracy(model, val_loader)
                 accuracy_history.append(acc)
                 eval_steps.append(step)
                 latest_acc = acc
@@ -1109,7 +1079,7 @@ def train_model(model, loader, val_loader, attn_mask=None, max_steps: int = 1000
     return loss_history, accuracy_history, eval_steps
 
 
-def show_example_predictions(model, model_name: str, dataset, attn_mask=None):
+def show_example_predictions(model, model_name: str, dataset):
     model.eval()
     with torch.no_grad():
         first_input, first_target = dataset[0]
@@ -1117,12 +1087,8 @@ def show_example_predictions(model, model_name: str, dataset, attn_mask=None):
         first_input = first_input.unsqueeze(0).to(device)
         last_input = last_input.unsqueeze(0).to(device)
 
-        if isinstance(model, TransformerRecallModel):
-            first_logits = model(first_input, mask=attn_mask)
-            last_logits = model(last_input, mask=attn_mask)
-        else:
-            first_logits = model(first_input)
-            last_logits = model(last_input)
+        first_logits = model(first_input)
+        last_logits = model(last_input)
 
         first_pred = first_logits.argmax(dim=-1).squeeze(0).cpu()
         last_pred = last_logits.argmax(dim=-1).squeeze(0).cpu()
@@ -1172,14 +1138,7 @@ if __name__ == "__main__":
 
     models_to_train = []
     if args.model == "all" or args.model == "transformer":
-        trans_model = TransformerRecallModel(
-            seq_len=seq_len,
-            d_model=64,
-            vocab_size=vocab_size,
-            num_layers=2,
-            num_heads=8,
-            dropout=0.1,
-        ).to(device)
+        trans_model = Transformer(args).to(device=device, dtype=getattr(torch, args.dtype))
         models_to_train.append(("Transformer", trans_model))
 
     if args.model == "all" or args.model == "spectron":

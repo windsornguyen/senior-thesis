@@ -1,251 +1,104 @@
 import math
+import random
+
+from typing import Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from tqdm import tqdm
 
+from tqdm import tqdm
 from torch.utils.data import DataLoader
+from torch.nn.functional import scaled_dot_product_attention as sdpa
+from torchtune.modules import RotaryPositionalEmbeddings as RoPE
 
 from thesis.experiments.synthetics.assoc_recall import generate_assoc_recall
 from thesis.experiments.synthetics.args import args
 from flash_attn import flash_attn_func
 
-def precompute_freqs_cis(head_dim: int, max_seq_len: int, theta: float = 10000.0):    
-    # For half the dimensions, build the scale factor:
-    freq_seq = torch.arange(0, head_dim, 2).float() / head_dim
-    freqs = 1.0 / (theta ** freq_seq)
-
-    # Outer product with positions
-    t = torch.arange(max_seq_len, dtype=torch.float32)
-    angles = torch.outer(t, freqs)
-
-    # Build a complex exponential e^{i * theta}
-    freqs_cis = torch.polar(
-        torch.ones_like(angles),
-        angles
-    )
-    return freqs_cis
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    """
-    x is [B, n_heads, seq_len, head_dim_as_complex],
-    so we want to broadcast freqs_cis from [max_seq_len, half_dim]
-    to [1, 1, seq_len, half_dim].
-    """
-    seq_len = x.shape[2]
-    freqs_cis = freqs_cis[:seq_len]  # slice down to current seq_len
-    return freqs_cis.view(1, 1, seq_len, -1)
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Convert real -> complex by grouping last dim in pairs
-    # shape => [B, n_heads, seq_len, head_dim//2, 2] => complex => [B, n_heads, seq_len, head_dim//2]
-    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-
-    # Broadcast the frequencies to match [B, n_heads, seq_len, head_dim//2]
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_complex)
-
-    # Multiply => apply rotation
-    xq_complex = xq_complex * freqs_cis
-    xk_complex = xk_complex * freqs_cis
-
-    # Convert back to real => shape [B, n_heads, seq_len, head_dim]
-    xq_out = torch.view_as_real(xq_complex).reshape(*xq.shape)
-    xk_out = torch.view_as_real(xk_complex).reshape(*xk.shape)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 class MLP(nn.Module):
-    """
-    Multi-Layer Perceptron (MLP) used as a feed-forward layer.
-
-    Attributes:
-        w1 (nn.Module): Linear layer for input-to-hidden transformation.
-        w2 (nn.Module): Linear layer for hidden-to-output transformation.
-        w3 (nn.Module): Additional linear layer for feature transformation.
-    """
-
     def __init__(self, dim: int, inter_dim: int):
-        """
-        Initializes the MLP layer.
-
-        Args:
-            dim (int): Input and output dimensionality.
-            inter_dim (int): Hidden layer dimensionality.
-        """
         super().__init__()
         self.w1 = nn.Linear(dim, inter_dim)
         self.w2 = nn.Linear(inter_dim, dim)
         self.w3 = nn.Linear(dim, inter_dim)
+        self.w2.SCALE_INIT = 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the MLP layer.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after MLP computation.
-        """
         return self.w2(F.gelu(self.w1(x), approximate="tanh") * self.w3(x))
 
 class Attention(nn.Module):
     def __init__(self, args):
-        super(Attention, self).__init__()
-        self.dim, self.num_heads = args.dim, args.num_heads
-        assert args.dim % args.num_heads == 0, f"dim ({self.dim}) must be divisible num_heads ({self.num_heads})"
+        super().__init__()
+        self.dim = args.dim
+        self.num_heads = args.num_heads
         self.head_dim = args.dim // args.num_heads
+        assert args.dim % args.num_heads == 0, "dim must be divisible by num_heads"
+        self.rope = RoPE(self.head_dim, args.seq_len, args.rope_theta)
 
-        self.wq = nn.Linear(args.dim, args.dim)
-        self.wk = nn.Linear(args.dim, args.dim)
-        self.wv = nn.Linear(args.dim, args.dim)
+        self.wq = nn.Linear(args.dim, args.dim, bias=args.bias)
+        self.wk = nn.Linear(args.dim, args.dim, bias=args.bias)
+        self.wv = nn.Linear(args.dim, args.dim, bias=args.bias)
 
         self.c_proj = nn.Linear(args.dim, args.dim, bias=args.bias)
         self.c_proj.SCALE_INIT = 1
 
-        self.alibi_slopes = self._get_alibi_slopes(self.num_heads) if args.use_alibi else None
-        self.window_size = args.window_size
-        self.softcap = args.softcap
+    def forward(self, x):
+        bsz, seq_len, dim = x.shape
 
-        self.dropout = args.dropout
-        self.resid_dropout = nn.Dropout(self.dropout)
+        q, k, v = self.wq(x), self.wk(x), self.wv(x)
 
-    def _generate_slopes(self, n: int):
-            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
-            return [start * (start**i) for i in range(n)]
+        q = q.view(bsz, seq_len, self.num_heads, self.head_dim)
+        k = k.view(bsz, seq_len, self.num_heads, self.head_dim)
+        v = v.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q, k = self.rope(q).transpose(1, 2), self.rope(k).transpose(1, 2)
 
-    def _get_alibi_slopes(self, num_heads: int, interpolation_factor: float = 0.25):
-        # If n_heads is a power of 2, generate slopes directly
-        if math.log2(num_heads).is_integer():
-            slopes = self._generate_slopes(num_heads)
-        else:
-            # Get slopes for the nearest power of two
-            n = nearest_power_of_two(num_heads, round_up=False)
-            slopes_power_of_two = self._generate_slopes(n)
+        y = sdpa(q, k, v, is_causal=True)
 
-            # Generate extra slopes
-            extra_slopes = self._generate_slopes(2 * n)
-            extra_slopes_trunc = extra_slopes[0::2][: num_heads - n]
-            slopes = slopes_power_of_two + extra_slopes_trunc
-        slopes = torch.tensor(slopes, device=torch.device("cuda")) # FA ALiBi must be on CUDA
-        slopes = slopes * interpolation_factor  # https://arxiv.org/pdf/2310.13017
-        return slopes
-
-    def forward(
-        self,
-        x: torch.Tensor = None,
-        q: torch.Tensor = None,
-        k: torch.Tensor = None,
-        v: torch.Tensor = None,
-        freqs_cis: torch.Tensor = None,
-    ) -> torch.Tensor:
-        if x is not None:
-            q = k = v = x
-        if any(t is None for t in [q, k, v]):
-            raise ValueError("Must provide either x for self-attention or q/k/v for cross-attention.")
-
-        bsz, q_len, dim = q.shape
-        _, k_len, _ = k.shape
-        _, v_len, _ = v.shape
-
-        q, k, v = self.wq(q), self.wk(k), self.wv(v)
-
-        # FlashAttention expects bsz, seq_len, num_heads, head_dim
-        q = q.view(bsz, q_len, self.num_heads, self.head_dim)
-        k = k.view(bsz, k_len, self.num_heads, self.head_dim)
-        v = v.view(bsz, v_len, self.num_heads, self.head_dim)
-
-        if self.alibi_slopes is None: # Either RoPE or ALiBi for positional embedding
-            q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)
-
-        y = flash_attn_func(  # https://arxiv.org/pdf/2307.08691
-            q=q, k=k, v=v,
-            dropout_p=self.dropout if self.training else 0.0,
-            causal=True,
-            window_size=(self.window_size, 0), # Set toseq_len if full attention
-            alibi_slopes=self.alibi_slopes, # https://arxiv.org/pdf/2108.12409
-
-            # NOTE: Softcapping cannot be used simultaneously with dropout
-            softcap=self.softcap,  # https://arxiv.org/pdf/2408.00118
-        )
-
-        out = y.contiguous().view(bsz, q_len, -1)
-        out = self.resid_dropout(self.c_proj(out))
+        out = y.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+        out = self.c_proj(out)
         return out
 
 class AttentionLayer(nn.Module):
-    def __init__(self, args) -> None:
-        super(AttentionLayer, self).__init__()
+    def __init__(self, args):
+        super().__init__()
         self.attn_norm = nn.RMSNorm(args.dim)
-        self.attn = Attention(args=args)
+        self.attn = Attention(args)
         self.mlp_norm = nn.RMSNorm(args.dim)
         self.mlp = MLP(args.dim, args.mlp_scale * args.dim)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor=None) -> torch.Tensor:
-        x = x + self.attn(x=self.attn_norm(x), freqs_cis=freqs_cis)
+    def forward(self, x):
+        x = x + self.attn(self.attn_norm(x))
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
 class Transformer(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.num_layers = args.num_layers
-        assert args.dim % args.num_heads == 0, f"dim ({args.dim}) must be divisible num_heads ({args.num_heads})"
-        self.head_dim = args.dim // args.num_heads
-
-        # From pytorch/pytorch#123411, we set persistent=True for torch.compile and PP compatibility
-        self.register_buffer(
-            "freqs_cis",
-            precompute_freqs_cis(
-                head_dim=self.head_dim,
-                max_seq_len=args.seq_len,
-                theta=args.theta,
-            ),
-            persistent=True,
-        )
-
         self.tok_emb = nn.Embedding(args.vocab_size, args.dim)
         self.dropout = nn.Dropout(args.dropout)
 
-        self.layers = nn.ModuleList()
-        for _ in range(args.num_layers):
-            self.layers.append(AttentionLayer(args))
+        self.layers = nn.ModuleList([
+            AttentionLayer(args) for _ in range(args.num_layers)
+        ])
 
         self.out_norm = nn.RMSNorm(args.dim)
         self.lm_head = nn.Linear(args.dim, args.vocab_size, bias=args.bias)
-        self.lm_head.SCALE_INIT = 1
-
-        if args.weight_tying:
-            self.tok_emb.weight = self.lm_head.weight
 
         self.std = args.dim ** -0.5
         self.apply(self._init_weights)
-        print("Model Parameter Count: %.2fM\n" % (self._get_num_params() / 1e6,))
 
-    def forward(self, x: torch.Tensor) -> torch.tensor:
-        tok_emb = self.tok_emb(x)
-        x = self.dropout(tok_emb)
+    def forward(self, x):
+        x = self.tok_emb(x)
 
         for layer in self.layers:
-            x = layer(x, freqs_cis=self.freqs_cis)
+            x = layer(x)
 
-        out = self.lm_head(self.out_norm(x))
-        return out
-
-    def _get_num_params(self):
-        n_params = sum(p.numel() for p in self.parameters())
-        if hasattr(self, "pos_emb") and self.pos_emb is not None:
-            n_params -= self.pos_emb.weight.numel()
-        return n_params
+        return self.lm_head(self.out_norm(x))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -254,8 +107,11 @@ class Transformer(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=self.std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=self.std)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
 def get_monic_chebyshev_coeffs(n: int) -> torch.Tensor:
     def chebyshev_t_int(n: int) -> list[int]:
@@ -558,17 +414,38 @@ def stu_conv(
 
     return U_plus, U_minus
 
-
-class LearnableSpectralFilters(nn.Module):
-    def __init__(
-        self, seq_len: int, k: int, use_hankel_L: bool = False, device=None, dtype: torch.dtype = torch.bfloat16
-    ):
+class HeadNorm(nn.Module):
+    def __init__(self, feature_dim, eps=1e-6):
         super().__init__()
-        filters = get_spectral_filters(seq_len, k, use_hankel_L, device, dtype)
-        self.filters = nn.Parameter(filters)
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(feature_dim))
+        self.beta = nn.Parameter(torch.zeros(feature_dim))
 
-    def forward(self):
-        return self.filters
+    def forward(self, x):
+        # x: (B, H, T, d_head)
+        mean = x.mean(dim=2, keepdim=True)  # (B, H, 1, d_head)
+        var = x.var(dim=2, keepdim=True, unbiased=False)  # (B, H, 1, d_head)
+        x_normalized = (x - mean) / torch.sqrt(var + self.eps)
+        return self.gamma * x_normalized + self.beta
+class MatrixHeadNorm(nn.Module):
+    def __init__(self, d_head, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        # learnable scale and bias parameters, shaped so that they broadcast
+        # over (B, H, T) dimensions
+        self.gamma = nn.Parameter(torch.ones(1, 1, 1, d_head, d_head))
+        self.beta  = nn.Parameter(torch.zeros(1, 1, 1, d_head, d_head))
+
+    def forward(self, x):
+        """
+        x: (B, H, T, d_head, d_head)
+        Normalizes each d_head x d_head matrix to have zero mean and unit variance,
+        where mean and variance are computed over the last two dimensions.
+        """
+        mean = x.mean(dim=(-2, -1), keepdim=True)
+        var  = x.var(dim=(-2, -1), keepdim=True, unbiased=False)
+        x_normalized = (x - mean) / torch.sqrt(var + self.eps)
+        return self.gamma * x_normalized + self.beta
 
 class SpectralAttention(nn.Module):
     def __init__(
@@ -584,6 +461,7 @@ class SpectralAttention(nn.Module):
         dtype=torch.float32,
     ):
         super().__init__()
+        assert dim % num_heads == 0, f"dim ({dim}) must be divisible by num_heads ({num_heads})"
         self.seq_len = seq_len
         self.dim = dim
         self.d_out = dim  # Same for now
@@ -616,6 +494,9 @@ class SpectralAttention(nn.Module):
             if not use_hankel_L:
                 self.M_phi_minus = nn.Parameter(torch.empty(k, dim, dim, dtype=dtype, device=device))
 
+        # Rotary positional embeddings
+        self.rope = RoPE(self.head_dim, seq_len, 10000.0)
+
         # Attention components
         self.Q = nn.Linear(dim, dim, device=device, dtype=dtype)
         self.K = nn.Linear(dim, dim, device=device, dtype=dtype)
@@ -624,9 +505,12 @@ class SpectralAttention(nn.Module):
 
         # Gate for combining attention and spectral features
         self.gate = nn.Linear(dim, dim, device=device, dtype=dtype)
+        
 
         # Normalization
-        self.norm = nn.RMSNorm(dim)
+        self.Q_norm = HeadNorm(self.head_dim)
+        self.K_norm = HeadNorm(self.head_dim)
+        self.H_norm = MatrixHeadNorm(self.head_dim)
 
     def compute_stu_features(self, u: torch.Tensor) -> torch.Tensor:
         """Compute STU features"""
@@ -665,21 +549,24 @@ class SpectralAttention(nn.Module):
 
         return out
 
-    def forward(self, x: torch.Tensor, chunk_len: int = 128) -> torch.Tensor:
+    def _cheby(self):
+        return self.p_coeffs_kernel.squeeze(-1).unsqueeze(0).unsqueeze(-1)
+
+    def forward(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor | dict:
         B, T, d = x.shape
 
         # Branch 1: Compute STU features
         x_tilde = self.compute_stu_features(x)  # (B, T, dim)
 
         # Branch 2: Compute multihead linear attention
-        Q = self.Q(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
-        K = self.K(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
-        V = self.V(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
+        Q = self.Q(x).view(B, T, self.num_heads, self.head_dim)
+        K = self.K(x).view(B, T, self.num_heads, self.head_dim)
+        V = self.V(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        Q, K = self.rope(Q).transpose(1, 2), self.rope(K).transpose(1, 2)
 
         # Apply non-linearities
-        Q = F.gelu(Q, approximate="tanh")
-        K = F.gelu(K, approximate="tanh")
-        V = F.gelu(V, approximate="tanh")
+        Q = F.softplus(Q, beta=2.0)  # (B, H, T, d_head)
+        K = F.softplus(K, beta=2.0)  # (B, H, T, d_head)
 
         # Linear attention computation
         Z = torch.einsum("bhtp,bhtn->bhtpn", V, K)  # (B, H, T, d_head, d_head)
@@ -687,16 +574,99 @@ class SpectralAttention(nn.Module):
         Y = torch.einsum("bhtp,bhtpn->bhtn", Q, H)  # (B, H, T, d_head)
 
         # Merge heads
-        Y_attn = Y.permute(0, 2, 1, 3).contiguous().view(B, T, d)  # (B, T, d)
+        Y_attn = Y.transpose(1, 2).contiguous().view(B, T, -1)  # (B, T, d)
 
         # Compute gate values
-        gate_values = torch.sigmoid(self.gate(x))  # (B, T, d)
+        gate_logits = torch.sigmoid(self.gate(x))  # (B, T, d)
+        attn_percentage = gate_logits.mean().item() * 100
+        spectral_percentage = (1 - gate_logits.mean().item()) * 100
+        print(f"Attention Branch Percentage: {attn_percentage:.2f}%")
+        print(f"Spectral Branch Percentage: {spectral_percentage:.2f}%")
 
-        # Combine branches using element-wise gating
-        Y_combined = gate_values * Y_attn + (1 - gate_values) * x_tilde
+        # Combine branches
+        Y_combined = gate_logits * Y_attn + (1 - gate_logits) * x_tilde
+        output = self.o_proj(Y_combined)
 
-        # Final projection and normalization
-        return self.o_proj(Y_combined)
+        if debug:
+            return {
+                'output': output,
+                'Q': Q,  # (B, H, T, d_head)
+                'K': K,  # (B, H, T, d_head)
+                'H': H   # (B, H, T, d_head, d_head)
+            }
+        return output
+    
+    # def normalized_cumsum(self, Z: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     Compute a cumulative sum over the time dimension with online softmax normalization.
+    #     Z: shape (B, H, T, d_head, d_head)
+        
+    #     For each time step t, we update:
+    #         m_new = max(m, Z[t])
+    #         d = d * exp(m - m_new) + exp(Z[t] - m_new)
+    #     and we output H_online[t] = d.
+        
+    #     Returns:
+    #         H_online: shape (B, H, T, d_head, d_head)
+    #     """
+    #     B, H, T, d1, d2 = Z.shape
+    #     # Initialize m to -infinity and d to 0, per element.
+    #     m = torch.full((B, H, d1, d2), -float('inf'), device=Z.device, dtype=Z.dtype)
+    #     d = torch.zeros((B, H, d1, d2), device=Z.device, dtype=Z.dtype)
+    #     H_online = []  # List to collect normalized cumulative states
+        
+    #     for t in range(T):
+    #         current = Z[:, :, t, :, :]  # shape (B, H, d1, d2)
+    #         m_new = torch.maximum(m, current)
+    #         # Adjust cumulative sum: scale previous sum to the new maximum and add current exp term.
+    #         d = d * torch.exp(m - m_new) + torch.exp(current - m_new)
+    #         m = m_new
+    #         H_online.append(d)
+    #     # Stack along the time dimension.
+    #     H_online = torch.stack(H_online, dim=2)  # shape: (B, H, T, d1, d2)
+    #     return H_online
+
+    # # Now, integrate this into your forward pass.
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:
+    #     B, T, d = x.shape
+
+    #     # Branch 1: Compute STU features (spectral branch)
+    #     x_tilde = self.compute_stu_features(x)  # (B, T, dim)
+
+    #     # Branch 2: Compute multihead linear attention
+    #     Q = self.Q(x).view(B, T, self.num_heads, self.head_dim)
+    #     K = self.K(x).view(B, T, self.num_heads, self.head_dim)
+    #     V = self.V(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+    #     # Apply RoPE and transpose so Q, K have shape (B, H, T, head_dim)
+    #     Q, K = self.rope(Q).transpose(1, 2), self.rope(K).transpose(1, 2)
+        
+    #     # Non-linearities
+    #     Q = F.gelu(Q)
+    #     K = F.gelu(K)
+        
+    #     # Compute unnormalized “pairwise” interactions: (B, H, T, head_dim, head_dim)
+    #     Z = torch.einsum("bhtp,bhtn->bhtpn", V, K)
+        
+    #     # Use the online softmax recurrence to compute a normalized cumulative sum along time.
+    #     H_online = self.normalized_cumsum(Z)  # (B, H, T, head_dim, head_dim)
+        
+    #     # Query the normalized cumulative state.
+    #     Y = torch.einsum("bhtp,bhtpn->bhtn", Q, H_online)  # (B, H, T, head_dim)
+        
+    #     # Merge heads back.
+    #     Y_attn = Y.transpose(1, 2).contiguous().view(B, T, -1)  # (B, T, d)
+        
+    #     # Compute gate values and combine with the spectral branch.
+    #     gate_values = torch.sigmoid(self.gate(x))  # (B, T, d)
+    #     attn_percentage = gate_values.mean().item() * 100
+    #     spectral_percentage = (1 - gate_values.mean().item()) * 100
+    #     print(f"Attention Branch Percentage: {attn_percentage:.2f}%")
+    #     print(f"Spectral Branch Percentage: {spectral_percentage:.2f}%")
+        
+    #     Y_combined = gate_values * Y_attn + (1 - gate_values) * x_tilde
+        
+    #     # Final projection.
+    #     return self.o_proj(Y_combined)
 
 
 class SpectralAttentionLayer(nn.Module):
@@ -731,7 +701,7 @@ class SpectralAttentionLayer(nn.Module):
         self.mlp = MLP(dim, 4 * dim)
         self.mlp_norm = nn.RMSNorm(dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor:
         """
         Forward pass of SpectralAttentionLayer.
 
@@ -741,8 +711,19 @@ class SpectralAttentionLayer(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (B, T, dim).
         """
-        x = x + self.spectral_attention(self.spectral_attention_norm(x))
+        if debug:
+            attn_result = self.spectral_attention(self.spectral_attention_norm(x), debug=True)
+            x = x + attn_result['output']
+            debug_info = {
+                'attn_Q': attn_result['Q'],
+                'attn_K': attn_result['K'],
+                'attn_H': attn_result['H']
+            }
+        else:
+            x = x + self.spectral_attention(self.spectral_attention_norm(x))
         x = x + self.mlp(self.mlp_norm(x))
+        if debug:
+            return x, debug_info
         return x
 
 
@@ -782,19 +763,10 @@ class Spectron(nn.Module):
 
         if d_out is None:
             d_out = vocab_size
-
         self.embedding = nn.Embedding(vocab_size, dim)
-
-        # Sinusoidal positional embeddings
-        position = torch.arange(seq_len, device=device).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim, 2, device=device) * (-math.log(10000.0) / dim))
-        pe = torch.zeros(seq_len, dim, device=device)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
-
-        self.in_dropout = nn.Dropout(dropout)
-        self.out_dropout = nn.Dropout(dropout)
+        self.use_tensordot = use_tensordot
+        self.use_hankel_L = use_hankel_L
+        self.num_layers = num_layers
 
         self.layers = nn.ModuleList(
             [
@@ -806,26 +778,11 @@ class Spectron(nn.Module):
         self.norm = nn.RMSNorm(dim)
         self.out_proj = nn.Linear(dim, d_out)
 
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights for all linear layers using Xavier uniform."""
-
-        def _init_module(module):
-            if isinstance(module, nn.Linear):
-                # Initialize weights with Xavier uniform
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            # Recursively initialize weights of all submodules
-            for submodule in module.children():
-                _init_module(submodule)
-
-        _init_module(self)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.std = dim ** -0.5
+        self.apply(self._init_weights)
+        print("Model Parameter Count: %.2fM\n" % (self._get_num_params() / 1e6,))
+    
+    def forward(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor:
         """
         Forward pass through the Spectron model.
 
@@ -835,20 +792,44 @@ class Spectron(nn.Module):
         Returns:
             torch.Tensor: Output logits of shape (B, T, d_out).
         """
-        B, T = x.shape
+        x = self.embedding(x)
+        debug_info = {}
+        for i, layer in enumerate(self.layers):
+            if debug and i == 0:  # Collect debug info from the first layer
+                x, layer_debug = layer(x, debug=True)
+                debug_info['layer_0'] = layer_debug
+            else:
+                x = layer(x)
+        x = self.norm(x)
+        out = self.out_proj(x)
+        if debug:
+            return out, debug_info
+        return out
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            if hasattr(module, "SCALE_INIT"):
+                self.std *= (2 * self.num_layers) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=self.std)
+        elif isinstance(module, SpectralAttention):
+            if self.use_tensordot:
+                torch.nn.init.xavier_normal_(module.M_inputs)
+                torch.nn.init.xavier_normal_(module.M_conv)
+                torch.nn.init.xavier_normal_(module.M_filters)
+            else:
+                torch.nn.init.xavier_normal_(module.M_phi_plus)
+                if not self.use_hankel_L:
+                    torch.nn.init.xavier_normal_(module.M_phi_minus)
 
-        # Add positional embeddings explicitly
-        x_emb = self.embedding(x) + self.pe.unsqueeze(0)
-        x_emb = self.in_dropout(x_emb)
-
-        out = x_emb
-        for layer in self.layers:
-            out = layer(out)
-
-        out = self.norm(out)
-        out = self.out_proj(out)
-        return self.out_dropout(out)
-
+    def _get_num_params(self):
+        n_params = sum(p.numel() for p in self.parameters())
+        if hasattr(self, "pos_emb") and self.pos_emb is not None:
+            n_params -= self.pos_emb.weight.numel()
+        return n_params
 
 class FlashSTU(nn.Module):
     """Wrapper for FlashSTU to match the interface of other models."""
@@ -941,33 +922,138 @@ class Mamba(nn.Module):
 # -----------------------------------------------------------------------------
 # Token-Level Accuracy Helper
 # -----------------------------------------------------------------------------
+# def compute_token_level_accuracy(model, loader, device=None):
+#     """
+#     Compute token-level accuracy while ignoring special tokens and target_ignore_idx.
+#     """
+#     if device is None:
+#         device = next(model.parameters()).device
+#     model.eval()
+#     correct_tokens = 0
+#     total_tokens = 0
+#     with torch.no_grad():
+#         for inputs, targets in loader:
+#             inputs, targets = inputs.to(device), targets.to(device)
+#             logits = model(inputs)
+#             predictions = logits.argmax(dim=-1)
+
+#             # Create mask for valid tokens (not target_ignore_idx)
+#             valid_mask = targets != -100
+
+#             # Calculate accuracy only on valid tokens
+#             match = (predictions == targets) & valid_mask
+#             correct_tokens += match.sum().item()
+#             total_tokens += valid_mask.sum().item()
+
+#     token_acc = 100.0 * correct_tokens / (total_tokens if total_tokens > 0 else 1)
+#     print(f"Token-Level Accuracy (ignoring padding): {token_acc:.2f}%")
+#     return token_acc
+
 def compute_token_level_accuracy(model, loader, device=None):
     """
-    Compute token-level accuracy while ignoring special tokens and target_ignore_idx.
+    Compute token-level accuracy and generate plots comparing attention weight spikiness and
+    monotonicity for a standard Softmax mechanism versus the Spectron model's attention mechanism.
+    
+    Args:
+        model: The Spectron model.
+        loader: DataLoader providing input batches.
+        device: Device to run the model on (defaults to model's device).
+    
+    Returns:
+        float: Token-level accuracy percentage.
     """
     if device is None:
         device = next(model.parameters()).device
     model.eval()
-    correct_tokens = 0
-    total_tokens = 0
+
     with torch.no_grad():
-        for inputs, targets in loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            logits = model(inputs)
-            predictions = logits.argmax(dim=-1)
+        # Process the first batch
+        inputs, targets = next(iter(loader))
+        inputs, targets = inputs.to(device), targets.to(device)
+        
+        # Get logits and debug info
+        logits, debug_info = model(inputs, debug=True)  # Assumes debug=True returns debug_info
+        predictions = logits.argmax(dim=-1)
+        valid_mask = targets != -100
+        correct_tokens = ((predictions == targets) & valid_mask).sum().item()
+        total_tokens = valid_mask.sum().item()
+        token_acc = 100.0 * correct_tokens / total_tokens if total_tokens > 0 else 0
 
-            # Create mask for valid tokens (not target_ignore_idx)
-            valid_mask = targets != -100
+        # Select example and query position (e.g., approximating Query 48)
+        example_idx = 0  # First example
+        non_masked_positions = valid_mask[example_idx].nonzero(as_tuple=False)
+        chosen_pos = non_masked_positions[48 % len(non_masked_positions)].item() if non_masked_positions.numel() > 0 else 0
 
-            # Calculate accuracy only on valid tokens
-            match = (predictions == targets) & valid_mask
-            correct_tokens += match.sum().item()
-            total_tokens += valid_mask.sum().item()
+        # Extract Q and K from debug_info (post-GELU)
+        Q = debug_info['layer_0']['attn_Q']  # Shape: (B, H, T, d_head)
+        K = debug_info['layer_0']['attn_K']  # Shape: (B, H, T, d_head)
+        Q_ex = Q[example_idx]  # (H, T, d_head)
+        K_ex = K[example_idx]  # (H, T, d_head)
+        d_head = Q_ex.size(-1)
 
-    token_acc = 100.0 * correct_tokens / (total_tokens if total_tokens > 0 else 1)
-    print(f"Token-Level Accuracy (ignoring padding): {token_acc:.2f}%")
+        # Compute Q_t and K up to position t
+        Q_chosen = Q_ex[:, chosen_pos, :]  # (H, d_head)
+        K_up_to_chosen = K_ex[:, :chosen_pos + 1, :]  # (H, t+1, d_head)
+
+        # Compute QK dot products: Q_t @ K_i for each i=0 to t
+        qk_dot = torch.einsum('hd,hpd->hp', Q_chosen, K_up_to_chosen)  # (H, t+1)
+
+        # **Softmax Attention Weights**
+        attn_weights_softmax = F.softmax(qk_dot / (d_head ** 0.5), dim=1)  # (H, t+1)
+        avg_attn_weights_softmax = attn_weights_softmax.mean(dim=0).cpu().numpy()  # (t+1,)
+
+        # **Spectron Attention Weights**
+        qk_dot_sum = qk_dot.sum(dim=1, keepdim=True)  # (H, 1)
+        attn_weights_spectron = qk_dot / (qk_dot_sum + 1e-10)  # (H, t+1), avoid division by zero
+        avg_attn_weights_spectron = attn_weights_spectron.mean(dim=0).cpu().numpy()  # (t+1,)
+
+        # Compute entropy to measure spikiness
+        entropy_softmax = - (avg_attn_weights_softmax * np.log(avg_attn_weights_softmax + 1e-10)).sum()
+        entropy_spectron = - (avg_attn_weights_spectron * np.log(avg_attn_weights_spectron + 1e-10)).sum()
+
+        # Positions for plotting
+        positions = np.arange(chosen_pos + 1)
+
+        # **Figure 2: Attention Weight Spikiness**
+        plt.figure(figsize=(12, 3))
+        for i, (mech, weights, entropy) in enumerate([
+            ('Softmax', avg_attn_weights_softmax, entropy_softmax),
+            ('Spectron', avg_attn_weights_spectron, entropy_spectron)
+        ], 1):
+            plt.subplot(1, 2, i)
+            plt.scatter(positions, weights, color='green', alpha=0.7)
+            plt.title(mech)
+            plt.xlabel('Position')
+            plt.ylabel(f'Query {chosen_pos} Attn. Weights')
+            plt.xlim(0, 40)
+            plt.ylim(0, max(0.25, weights.max() * 1.1))
+            plt.text(0.95, 0.95, f'Entropy: {entropy:.3f}', transform=plt.gca().transAxes, ha='right', va='top')
+        plt.tight_layout()
+        plt.suptitle('Figure 2: Attention Weight Spikiness', y=1.1)
+        plt.show()
+
+        # **Figure 3: Attention Weight Monotonicity**
+        plt.figure(figsize=(12, 3))
+        for i, (mech, weights) in enumerate([
+            ('Softmax', avg_attn_weights_softmax),
+            ('Spectron', avg_attn_weights_spectron)
+        ], 1):
+            qk = qk_dot.mean(dim=0).cpu().numpy()  # (t+1,)
+            sorted_indices = np.argsort(qk)
+            qk_sorted = qk[sorted_indices]
+            attn_sorted = weights[sorted_indices]
+            
+            plt.subplot(1, 2, i)
+            plt.plot(qk_sorted, attn_sorted, color='green')
+            plt.title(mech)
+            plt.xlabel('QK Dot Product')
+            plt.ylabel('Attention Weight')
+            plt.tight_layout()
+        plt.suptitle('Figure 3: Attention Weight Monotonicity', y=1.1)
+        plt.show()
+
+    print(f"Token-Level Accuracy: {token_acc:.2f}%")
     return token_acc
-
 
 # -----------------------------------------------------------------------------
 # Training Loop (step-based)
@@ -1009,7 +1095,7 @@ def train_model(model, loader, val_loader, max_steps: int = 10000, eval_interval
             pbar.update(1)
 
             if step % eval_interval == 0:
-                acc = compute_token_level_accuracy(model, val_loader)
+                acc = compute_token_level_accuracy(model, val_loader, device)
                 accuracy_history.append(acc)
                 eval_steps.append(step)
                 latest_acc = acc

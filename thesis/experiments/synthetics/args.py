@@ -45,5 +45,10 @@ parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
 # Optimizations configs
 parser.add_argument("--torch_compile", type=bool, default=False, help="Use torch.compile")
 
+# RoPE configs
+parser.add_argument("--rope_theta", type=float, default=10000.0, help="RoPE theta")
+parser.add_argument("--rope_factor", type=float, default=40.0, help="RoPE factor")
+parser.add_argument("--beta_fast", type=int, default=32, help="Beta fast")
+parser.add_argument("--beta_slow", type=int, default=1, help="Beta slow")
 
 args = parser.parse_args()

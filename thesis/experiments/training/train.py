@@ -1,210 +1,145 @@
 import hydra
+import torch
 import torch.nn as nn
 import wandb
+import os
 
 from omegaconf import DictConfig, OmegaConf
-from wandb_osh.hooks import TriggerWandbSyncHook
 from pathlib import Path
+from tqdm import tqdm
 
 from thesis.experiments.utils.data import create_dataset, create_train_val_dataloaders
 from thesis.utils.logger import logger
 from thesis.experiments.utils.model import create_model
-from thesis.experiments.training.state import TrainState
-from thesis.utils.callbacks import (
-    CallbackManager,
-    MetricLoggerCallback,
-    GPUMemoryCallback,
-    CheckpointCallback,
-    PlottingCallback,
-)
-from thesis.experiments.utils.config import (
-    check_experiment_exists,
-    get_experiment_dir,
-    save_experiment_config,
-)
-from thesis.distributed import is_distributed
-from thesis.utils.pytorch import get_device_info
-from thesis.utils.optimizer import build_optimizers
-from thesis.utils.scheduler import build_lr_schedulers
+from thesis.experiments.utils.config import get_experiment_dir, save_experiment_config
 
 
 @hydra.main(version_base="1.3.2", config_path="pkg://thesis.experiments.conf", config_name="config")
 def main(config: DictConfig) -> None:
-    # Check if experiment already exists
-    if existing_exp := check_experiment_exists(config):
-        logger.warning(
-            f"Experiment with this config already exists at {existing_exp}. "
-            "Use --force to rerun or modify config to run a new experiment."
-        )
-        if not config.get("force", False):
-            return
-
-    # Ensure parallelism config exists for distributed training
-    if is_distributed() and not hasattr(config, "parallelism"):
-        config.parallelism = {
-            "dp_replicate": 1,
-            "dp_shard": -1,  # Will be auto-inferred
-            "cp": 1,
-            "tp": 1,
-            "pp": 1,
-            "enable_loss_parallel": False,
-        }
-        logger.info("Created default parallelism config for distributed training.")
-
-    # Get experiment directory
+    # Get experiment directory and save config
     exp_dir = get_experiment_dir(config)
-
-    # Convert config to dict for wandb
-    config_dict = OmegaConf.to_container(config, resolve=True)
-
-    # Pretty print config
-    logger.info("=" * 50)
-    logger.info("Experiment Configuration:")
-    logger.info("=" * 50)
-
-    def pretty_print(d, indent=0):
-        for key, value in d.items():
-            # Skip parallelism config if not in distributed mode
-            if key == "distributed" and not is_distributed():
-                continue
-            prefix = "  " * indent + "├─"
-            if isinstance(value, dict):
-                logger.info(f"{prefix} {key}:")
-                pretty_print(value, indent + 1)
-            else:
-                logger.info(f"{prefix} {key}: {value}")
-
-    pretty_print(config_dict)
-    logger.info("=" * 50)
-
-    # Ask for user confirmation
-    response = input("\n[CONFIRM]: Are these configurations correct? (y/n): ").lower().strip()
-    if response != "y":
-        logger.info("Experiment cancelled by user.")
-        return
-
-    # Create experiment directory and save configs after confirmation
     exp_dir.mkdir(parents=True, exist_ok=True)
     save_experiment_config(config, exp_dir)
 
-    # Update config to use experiment directory for logging
-    config.logging.log_dir = str(exp_dir / "logs")
-
-    # Setup wandb in offline mode with sync hook
-    trigger_sync = TriggerWandbSyncHook()
-    wandb.init(
-        project="thesis",
-        config=config_dict,
-        mode="offline",
-        name=f"{config.task.name}_{config.model_type}",
-        dir=str(exp_dir),
-    )
+    # Setup wandb (not setting up for now)
+    # wandb.init(
+    #     project="thesis",
+    #     config=OmegaConf.to_container(config, resolve=True),
+    #     name=f"{config.task.name}_{config.model_type}",
+    #     dir=str(exp_dir),
+    # )
 
     # Setup device
-    device_type, device = get_device_info(return_type="type_device")
-    logger.info(f"Using device: {device}")
+    device = torch.device("cuda")
+    print(f"Using device: {device}")
 
     # Create dataset and dataloaders
     dataset_info = create_dataset(config)
     train_loader, val_loader, expected_shapes = create_train_val_dataloaders(
-        dataset_info, batch_size=config.training.batch_size, pin_memory=device_type == "cuda"
+        dataset_info, batch_size=config.training.batch_size
     )
 
-    # Create model with validation against dataset shapes
+    # Create model
     model = create_model(config, expected_shapes, device)
-    wandb.watch(model, log_freq=100)  # Log model gradients
+    wandb.watch(model, log_freq=100)
 
     # Setup training components
     criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.training.max_steps)
 
-    # Build optimizers and schedulers
-    optimizer = build_optimizers([model], config)
-    scheduler = build_lr_schedulers(optimizer.optimizers, config)
-
-    # Create training state
-    state = TrainState(
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
-        device=device,
-        config=config,
-    )
-
-    # Initialize callbacks
-    callbacks = []
-    callbacks.append(MetricLoggerCallback(outdir=str(Path(config.logging.log_dir) / "metrics.jsonl"), args=config))
-    if device_type == "cuda":
-        callbacks.append(GPUMemoryCallback(device=device, log_interval=100, logger_callback=callbacks[0]))
-    callbacks.append(
-        CheckpointCallback(model=model, save_dir=config.logging.log_dir, save_interval=config.logging.save_period)
-    )
-    # Add plotting callback
-    callbacks.append(
-        PlottingCallback(
-            outdir=str(Path(config.logging.log_dir) / "plots"),
-            task_type="llm" if config.task.name == "pretraining" else "synthetic",
-        )
-    )
-    callback_manager = CallbackManager(callbacks)
+    # Training loop
+    best_val_loss = float("inf")
+    step = 0
 
     logger.info("Starting training...")
-    # Log training schedule info
-    logger.info(
-        f"Training Schedule:\n"
-        f"- Total Steps: {config.training.max_steps:,}\n"
-        f"- Batch Size: {config.training.batch_size}\n"
-        f"- Validation Every: {config.training.eval_period} steps\n"
-        f"- Checkpoint Every: {config.logging.save_period} steps\n"
-        f"- Gradient Accumulation: {'enabled' if config.training.gradient_accumulation.enabled else 'disabled'}"
+    pbar = tqdm(total=config.training.max_steps, desc="Training")
+
+    while step < config.training.max_steps:
+        model.train()
+        for batch in train_loader:
+            if step >= config.training.max_steps:
+                break
+
+            # Move batch to device
+            inputs = batch[0].to(device)
+            targets = batch[1].to(device)
+
+            # Forward pass
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
+
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            # Log training metrics
+            wandb.log({"train/loss": loss.item(), "train/lr": scheduler.get_last_lr()[0]}, step=step)
+
+            # Update progress bar
+            pbar.update(1)
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            # Validation
+            if step % config.training.eval_period == 0:
+                model.eval()
+                val_loss = 0
+                val_correct = 0
+                val_total = 0
+
+                with torch.no_grad():
+                    for val_batch in val_loader:
+                        val_inputs = val_batch[0].to(device)
+                        val_targets = val_batch[1].to(device)
+
+                        val_outputs = model(val_inputs)
+                        val_loss += criterion(val_outputs.view(-1, val_outputs.size(-1)), val_targets.view(-1)).item()
+
+                        predictions = val_outputs.argmax(dim=-1)
+                        val_correct += (predictions == val_targets).sum().item()
+                        val_total += val_targets.numel()
+
+                val_loss /= len(val_loader)
+                val_accuracy = 100 * val_correct / val_total
+
+                # Log validation metrics
+                wandb.log({"val/loss": val_loss, "val/accuracy": val_accuracy}, step=step)
+
+                logger.info(f"Step {step}: val_loss={val_loss:.4f}, val_acc={val_accuracy:.2f}%")
+
+                # Save best model
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    torch.save(
+                        {
+                            "step": step,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "val_loss": val_loss,
+                        },
+                        os.path.join(exp_dir, "best_model.pt"),
+                    )
+
+            step += 1
+
+    pbar.close()
+    wandb.finish()
+
+    # Save final model
+    torch.save(
+        {
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_loss": best_val_loss,
+        },
+        os.path.join(exp_dir, "final_model.pt"),
     )
-    callback_manager.on_train_start(config=config, model=model)
 
-    try:
-        while state.step < config.training.max_steps:
-            for batch in state.train_loader:
-                loss = state.train_step(batch)
-                state.train_losses.append(loss)
-
-                # Log training metrics
-                metrics = {
-                    "train/loss": loss,
-                    "train/lr": state.get_current_lr(),
-                }
-                wandb.log(metrics, step=state.step)
-                callback_manager.on_step_end(state.step, loss, metrics)
-
-                # Run validation if we have a validation loader
-                if state.val_loader is not None and state.step % config.training.eval_period == 0:
-                    val_loss, val_acc = state.validate()
-                    metrics = state.update_best_metrics(val_loss, val_acc)
-                    callback_manager.on_validation_end(state.step, metrics)
-
-                    logger.info(f"Step {state.step}: val_loss={val_loss:.4f}, val_acc={val_acc:.2f}%")
-                    trigger_sync()  # Trigger wandb sync after validation
-
-                state.step += 1
-                if state.step >= config.training.max_steps:
-                    break
-
-        # Final validation
-        val_loss, val_acc = state.validate()
-        logger.info(f"Training finished. Final val_loss={val_loss:.4f}, val_acc={val_acc:.2f}%")
-        wandb.log({"val/final_loss": val_loss, "val/final_accuracy": val_acc}, step=state.step)
-        trigger_sync()  # Final sync
-        callback_manager.on_train_end()
-
-        # Mark experiment as completed only if training finished without errors
-        (exp_dir / "completed.flag").touch()
-
-    except Exception as e:
-        logger.exception("Runtime error occurred during training. Experiment will not be marked complete.")
-        raise
-    finally:
-        # Ensure wandb sync/finish is always called
-        wandb.finish()
+    # Mark experiment as completed
+    (exp_dir / "completed.flag").touch()
 
 
 if __name__ == "__main__":

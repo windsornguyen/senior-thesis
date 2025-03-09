@@ -1,0 +1,32 @@
+model_type: Spectron
+
+# Core model dimensions
+dim: 64  # Base model dimension
+num_heads: 8
+num_layers: 2
+seq_len: 128
+vocab_size: 32
+
+# Architecture specifics
+k: ${eval:ceil(log(${seq_len}))}
+r: 64
+mlp_scale: 4
+dropout: 0.1
+
+# Spectral configurations
+use_hankel_L: false
+use_tensordot: false
+
+# Training specifics
+bsz: 64
+dtype: torch.bfloat16
+
+# Optional configurations
+bias: false
+use_flash_fft: false
+use_attn: true
+
+# Derived attributes
+hidden_size: ${dim}
+intermediate_size: ${eval:${dim} * ${mlp_scale}}
+hidden_act: swish

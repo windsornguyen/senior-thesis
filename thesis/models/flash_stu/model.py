@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import PreTrainedModel, PretrainedConfig
-
+from torchtune.modules import RotaryPositionalEmbeddings as RoPE
 
 try:
     from flashfftconv import FlashFFTConv
@@ -60,57 +60,6 @@ def get_spectral_filters(
     sigma_k, phi_k = sigma[-K:], phi[:, -K:]
     phi_k *= sigma_k ** 0.25
     return phi_k.to(dtype=dtype)
-
-
-def precompute_freqs_cis(head_dim: int, max_seq_len: int, theta: float = 10000.0):    
-    # For half the dimensions, build the scale factor:
-    freq_seq = torch.arange(0, head_dim, 2).float() / head_dim
-    freqs = 1.0 / (theta ** freq_seq)
-
-    # Outer product with positions
-    t = torch.arange(max_seq_len, dtype=torch.float32)
-    angles = torch.outer(t, freqs)
-    
-    # Build a complex exponential e^{i * theta}
-    freqs_cis = torch.polar(
-        torch.ones_like(angles),
-        angles
-    )
-    return freqs_cis
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    """
-    x is [B, n_heads, seq_len, head_dim_as_complex],
-    so we want to broadcast freqs_cis from [max_seq_len, half_dim]
-    to [1, 1, seq_len, half_dim].
-    """
-    seq_len = x.shape[2]
-    freqs_cis = freqs_cis[:seq_len]  # slice down to current seq_len
-    return freqs_cis.view(1, 1, seq_len, -1)
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Convert real -> complex by grouping last dim in pairs
-    # shape => [B, n_heads, seq_len, head_dim//2, 2] => complex => [B, n_heads, seq_len, head_dim//2]
-    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-
-    # Broadcast the frequencies to match [B, n_heads, seq_len, head_dim//2]
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_complex)
-
-    # Multiply => apply rotation
-    xq_complex = xq_complex * freqs_cis
-    xk_complex = xk_complex * freqs_cis
-
-    # Convert back to real => shape [B, n_heads, seq_len, head_dim]
-    xq_out = torch.view_as_real(xq_complex).reshape(*xq.shape)
-    xk_out = torch.view_as_real(xk_complex).reshape(*xk.shape)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 def poly_mul_x(poly):
     # Multiply polynomial by x: shift coefficients right by one index.
@@ -178,7 +127,6 @@ def fft_conv(u: torch.Tensor, v: torch.Tensor, mode: str = "full", causal: bool 
     """
     assert mode in {"full", "same", "valid"}, f"Invalid mode '{mode}'"
     B, L, d = u.shape
-    dtype = u.dtype
 
     # Ensure v has shape (F, d, k)
     if v.ndim == 2:
@@ -224,7 +172,7 @@ def fft_conv(u: torch.Tensor, v: torch.Tensor, mode: str = "full", causal: bool 
     if result.shape[-1] == 1:
         result = result.squeeze(-1)
 
-    return result.to(dtype=u.dtype)
+    return result.type_as(u)
 
 def stu_conv(u: torch.Tensor, v: torch.Tensor, n: int, use_tensordot: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
     bsz, seq_len, d_in = u.shape
@@ -425,38 +373,20 @@ class Attention(nn.Module):
         self.dim, self.num_heads = config.dim, config.num_heads
         assert config.dim % config.num_heads == 0, f"dim ({self.dim}) must be divisible num_heads ({self.num_heads})"
         self.head_dim = config.dim // config.num_heads
+        self.rope = RoPE(self.head_dim, config.seq_len, config.rope_theta)
 
-        self.c_attn = nn.Linear(self.dim, 3 * self.dim, bias=config.bias)
+        self.wq = nn.Linear(config.dim, config.dim, bias=config.bias)
+        self.wk = nn.Linear(config.dim, config.dim, bias=config.bias)
+        self.wv = nn.Linear(config.dim, config.dim, bias=config.bias)
+
         self.c_proj = nn.Linear(config.dim, config.dim, bias=config.bias)
         self.c_proj.SCALE_INIT = 1
 
-        self.alibi_slopes = self._get_alibi_slopes(self.num_heads) if config.use_alibi else None
         self.window_size = config.window_size
         self.softcap = config.softcap
 
         self.dropout = config.dropout
         self.resid_dropout = nn.Dropout(self.dropout)
-
-    def _generate_slopes(self, n: int):
-            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
-            return [start * (start**i) for i in range(n)]
-
-    def _get_alibi_slopes(self, num_heads: int, interpolation_factor: float = 0.25):
-        # If n_heads is a power of 2, generate slopes directly
-        if math.log2(num_heads).is_integer():
-            slopes = self._generate_slopes(num_heads)
-        else:
-            # Get slopes for the nearest power of two
-            n = nearest_power_of_two(num_heads, round_up=False)
-            slopes_power_of_two = self._generate_slopes(n)
-
-            # Generate extra slopes
-            extra_slopes = self._generate_slopes(2 * n)
-            extra_slopes_trunc = extra_slopes[0::2][: num_heads - n]
-            slopes = slopes_power_of_two + extra_slopes_trunc
-        slopes = torch.tensor(slopes, device=torch.device("cuda")) # FA ALiBi must be on CUDA
-        slopes = slopes * interpolation_factor  # https://arxiv.org/pdf/2310.13017
-        return slopes
 
     def forward(
         self,
@@ -464,7 +394,6 @@ class Attention(nn.Module):
         q: torch.Tensor = None,
         k: torch.Tensor = None,
         v: torch.Tensor = None,
-        freqs_cis: torch.Tensor = None,
     ) -> torch.Tensor:
         if x is not None:
             q = k = v = x
@@ -475,24 +404,19 @@ class Attention(nn.Module):
         _, k_len, _ = k.shape
         _, v_len, _ = v.shape
 
-        qkv = self.c_attn(x)
-        q, k, v = torch.chunk(qkv, 3, dim=2)
+        q, k, v = self.wq(x), self.wk(x), self.wv(x)
 
-        # FlashAttention expects bsz, seq_len, num_heads, head_dim
         q = q.view(bsz, q_len, self.num_heads, self.head_dim)
         k = k.view(bsz, k_len, self.num_heads, self.head_dim)
         v = v.view(bsz, v_len, self.num_heads, self.head_dim)
-
-        if self.alibi_slopes is None: # Either RoPE or ALiBi for positional embedding
-            q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)
+        q, k = self.rope(q), self.rope(k)
 
         y = flash_attn_func(  # https://arxiv.org/pdf/2307.08691
             q=q, k=k, v=v,
             dropout_p=self.dropout if self.training else 0.0,
             causal=True,
-            window_size=(self.window_size, 0), # Set to config.seq_len if full attention
-            alibi_slopes=self.alibi_slopes, # https://arxiv.org/pdf/2108.12409
-            
+            window_size=(self.window_size, 0), # Set to seq_len if full attention
+
             # NOTE: Softcapping cannot be used simultaneously with dropout
             softcap=self.softcap,  # https://arxiv.org/pdf/2408.00118
         )
@@ -509,8 +433,8 @@ class AttentionLayer(nn.Module):
         self.mlp_norm = nn.RMSNorm(config.dim)
         self.mlp = MLP(config.dim, config.mlp_scale * config.dim)
 
-    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor=None) -> torch.Tensor:
-        x = x + self.attn(x=self.attn_norm(x), freqs_cis=freqs_cis)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(x=self.attn_norm(x))
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -536,6 +460,8 @@ class MLP(nn.Module):
         self.w1 = nn.Linear(dim, inter_dim)
         self.w2 = nn.Linear(inter_dim, dim)
         self.w3 = nn.Linear(dim, inter_dim)
+        
+        self.w2.SCALE_INIT = 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -573,8 +499,7 @@ class FlashSTUConfig(PretrainedConfig):
         use_tensordot: bool = True,
         use_attn: bool = True,
         softcap: float = 50.0,
-        theta: float = 10000.0,
-        use_alibi: bool = False,
+        rope_theta: float = 10000.0,
         dilation: int = 2,  # For dilated sliding window attention mask, if used
         torch_dtype: torch.dtype = torch.bfloat16,
         device: torch.device = None,
@@ -601,8 +526,7 @@ class FlashSTUConfig(PretrainedConfig):
         self.use_tensordot = use_tensordot
         self.use_attn = use_attn
         self.softcap = softcap
-        self.theta = theta
-        self.use_alibi = use_alibi
+        self.rope_theta = rope_theta
         self.torch_dtype = torch_dtype
         self.device = device
 
@@ -614,17 +538,6 @@ class FlashSTU(PreTrainedModel):
         self.num_layers = config.num_layers
         assert config.dim % config.num_heads == 0, f"dim ({self.dim}) must be divisible num_heads ({self.num_heads})"
         self.head_dim = config.dim // config.num_heads
-
-        # From pytorch/pytorch#123411, we set persistent=True for torch.compile and PP compatibility
-        self.register_buffer(
-            "freqs_cis",
-            precompute_freqs_cis(
-                head_dim=self.head_dim,
-                max_seq_len=config.seq_len,
-                theta=config.theta,
-            ),
-            persistent=True,
-        )
 
         self.use_tensordot = config.use_tensordot
         self.use_hankel_L = config.use_hankel_L
@@ -655,10 +568,7 @@ class FlashSTU(PreTrainedModel):
         x = self.dropout(tok_emb)
 
         for layer in self.layers:
-            if hasattr(layer, "attn"): # Pass RoPE freq_cis to attention layers
-                x = layer(x, freqs_cis=self.freqs_cis)
-            else:
-                x = layer(x)
+            x = layer(x)
 
         y_hat = self.lm_head(self.norm(x))
         return y_hat
@@ -678,13 +588,6 @@ class FlashSTU(PreTrainedModel):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=self.std)
-        elif isinstance(module, Attention):
-            torch.nn.init.xavier_normal_(module.c_attn.weight)
-            torch.nn.init.xavier_normal_(module.c_proj.weight)
-            if module.c_attn.bias is not None:
-                torch.nn.init.zeros_(module.c_attn.bias)
-            if module.c_proj.bias is not None:
-                torch.nn.init.zeros_(module.c_proj.bias)
         elif isinstance(module, STU):
             if self.use_tensordot:
                 torch.nn.init.xavier_normal_(module.M_inputs)
