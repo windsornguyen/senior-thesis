@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/scratch/gpfs/mn4560/thesis/thesis/experiments/synthetics/jax_scan_attn_copy.py", line 23, in <module>
+    matplotlib.use('TkAgg')
+  File "/scratch/gpfs/mn4560/.conda/envs/thesis/lib/python3.12/site-packages/matplotlib/__init__.py", line 1255, in use
+    plt.switch_backend(name)
+  File "/scratch/gpfs/mn4560/.conda/envs/thesis/lib/python3.12/site-packages/matplotlib/pyplot.py", line 423, in switch_backend
+    raise ImportError(
+ImportError: Cannot load backend 'TkAgg' which requires the 'tk' interactive framework, as 'headless' is currently running
+srun: error: della-k18g3: task 0: Exited with exit code 1
+srun: Terminating StepId=63320915.0

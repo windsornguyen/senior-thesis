@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import PreTrainedModel, PretrainedConfig
+from torch.nn.functional import scaled_dot_product_attention as sdpa
 from torchtune.modules import RotaryPositionalEmbeddings as RoPE
 
 try:
@@ -53,7 +54,7 @@ def get_spectral_filters(
     K: int, 
     use_hankel_L: bool = False, 
     device: torch.device = None,
-    dtype: torch.dtype = torch.bfloat16,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     Z = get_hankel(seq_len, use_hankel_L).to(device)
     sigma, phi = torch.linalg.eigh(Z, UPLO="U")
@@ -429,7 +430,7 @@ class AttentionLayer(nn.Module):
     def __init__(self, config) -> None:
         super(AttentionLayer, self).__init__()
         self.attn_norm = nn.RMSNorm(config.dim)
-        self.attn = Attention(config=config)
+        self.attn = Attention(args=config)
         self.mlp_norm = nn.RMSNorm(config.dim)
         self.mlp = MLP(config.dim, config.mlp_scale * config.dim)
 
@@ -473,7 +474,7 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        return self.w2(F.gelu(self.w1(x), approximate="tanh") * self.w3(x))
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class FlashSTUConfig(PretrainedConfig):
 
@@ -501,7 +502,7 @@ class FlashSTUConfig(PretrainedConfig):
         softcap: float = 50.0,
         rope_theta: float = 10000.0,
         dilation: int = 2,  # For dilated sliding window attention mask, if used
-        torch_dtype: torch.dtype = torch.bfloat16,
+        torch_dtype: torch.dtype = torch.float32,
         device: torch.device = None,
         **kwargs,
     ):

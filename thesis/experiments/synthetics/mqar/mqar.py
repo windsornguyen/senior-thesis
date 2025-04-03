@@ -142,9 +142,9 @@ def generate_mqar(
     alpha: float = 2.0,
     seed: int = 1746,
 ) -> TensorDataset:
-    assert sequence_len % 2 == 0, "sequence_len must be even"
-    assert vocab_size > sequence_len, "vocab_size must be greater than sequence_len"
-    assert num_pairs * 4 <= sequence_len, "sequence_len must be >= 4 * num_pairs"
+    assert sequence_len % 2 == 0, f"sequence_len must be even, got {sequence_len}"
+    assert vocab_size > sequence_len, f"vocab_size must be greater than sequence_len, got {vocab_size} and {sequence_len}"
+    assert num_pairs * 4 <= sequence_len, f"sequence_len must be >= 4 * num_pairs, got {sequence_len} and {num_pairs}"
 
     torch.manual_seed(seed)
 

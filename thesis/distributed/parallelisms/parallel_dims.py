@@ -12,7 +12,7 @@ class ParallelDims:
     Args:
         dp_replicate: Data parallel replication factor
         dp_shard: Data parallel sharding factor (-1 indicates auto-infer)
-        cp: Some form of "checkpoint parallel" or "pipeline concurrency" dimension
+        cp: Context parallel factor
         tp: Tensor parallel factor
         pp: Pipeline parallel factor
         world_size: Total number of ranks/devices

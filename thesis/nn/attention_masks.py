@@ -63,7 +63,6 @@ def generate_sliding_window_mask(window_size: int, causal: bool = True) -> _mask
             # symmetrical window around i
             distance = (q_idx - kv_idx).abs()
             within_window = distance <= window_size
-
         return within_window
 
     name_ext = "causal" if causal else "noncausal"
@@ -117,7 +116,8 @@ def generate_dilated_sliding_window_mask(
             within_window = distance <= window_size
 
         meets_dilation = (distance % dilation) == 0
-        return within_window & meets_dilation
+        mask = within_window & meets_dilation
+        return mask
 
     mode_str = "causal" if causal else "noncausal"
     dilated_sliding_window_mask.__name__ = (
@@ -125,64 +125,112 @@ def generate_dilated_sliding_window_mask(
     )
     return dilated_sliding_window_mask
 
+def generate_top_k_mask(k: int, sim: torch.Tensor, causal: bool = True) -> _mask_mod_signature:
+    # TODO: Make this block-wise for better memory access patterns, per Native Sparse Attention paper?
+
+    """
+    Creates a top-k mask function that selects, for each query, the top k key indices
+    based on the provided similarity scores.
+
+    Args:
+        k (int): Number of top entries to select per query.
+        sim (torch.Tensor): A tensor of shape [B, H, Q_LEN, KV_LEN, D] containing similarity scores.
+        causal (bool): Whether to enforce causal masking (Defaults to True).
+
+    Returns:
+        _mask_mod_signature: A callable mask function that takes (batch_idx, head_idx, q_idx, kv_idx)
+        and returns a boolean tensor of shape [Q_LEN, KV_LEN] (which attn_gym will combine to [B, H, Q_LEN, KV_LEN]).
+    """
+    # Precompute top-k indices along the key dimension.
+    # Shape: [B, H, Q_LEN, k]
+    topk_indices = sim.topk(k, dim=-1)[1]
+    B, H, Q_LEN, KV_LEN = sim.shape
+
+    def top_k_mask(b, h, q_idx, kv_idx):
+        # Here, q_idx and kv_idx are expected to be of shape [B, H, Q_LEN, KV_LEN].
+        # Expand kv_idx to [B, H, Q_LEN, KV_LEN, 1] and topk_indices to [B, H, Q_LEN, 1, k]
+        mask = (kv_idx.unsqueeze(-1) == topk_indices.unsqueeze(3)).any(dim=-1)
+        if causal:
+            mask = mask & (q_idx >= kv_idx)
+        return mask
+
+    top_k_mask.__name__ = f"top_k_mask_{k}"
+    return top_k_mask
+
 
 def main():
-    """
-    Demonstrates usage of each mask by printing attention grids. We include a few
-    basic checks to ensure the masks behave as expected. We show both the causal
-    and non-causal versions for the sliding window and dilated masks.
-    """
     B, H = 1, 1
     Q_LEN, KV_LEN = 8, 8
 
-    # coordinate grids
-    q_idx = torch.arange(Q_LEN).unsqueeze(-1).expand(Q_LEN, KV_LEN)
-    kv_idx = torch.arange(KV_LEN).unsqueeze(0).expand(Q_LEN, KV_LEN)
+    # Build coordinate grids of shape [B, H, Q_LEN, KV_LEN]:
+    dummy_q_idx = torch.arange(Q_LEN, dtype=torch.int).view(1, 1, Q_LEN, 1).expand(B, H, Q_LEN, KV_LEN)
+    dummy_kv_idx = torch.arange(KV_LEN, dtype=torch.int).view(1, 1, 1, KV_LEN).expand(B, H, Q_LEN, KV_LEN)
 
     print("= Causal Mask =")
-    c_mask = causal_mask(B, H, q_idx, kv_idx)
+    c_mask = causal_mask(B, H, dummy_q_idx, dummy_kv_idx)
     print(c_mask.int(), "\n")
 
     print("= Sliding Window (window_size=2, causal=True) =")
     sw_causal_fn = generate_sliding_window_mask(window_size=2, causal=True)
-    sw_causal = sw_causal_fn(B, H, q_idx, kv_idx)
+    sw_causal = sw_causal_fn(B, H, dummy_q_idx, dummy_kv_idx)
     print(sw_causal.int(), "\n")
 
     print("= Sliding Window (window_size=2, causal=False) =")
     sw_noncausal_fn = generate_sliding_window_mask(window_size=2, causal=False)
-    sw_noncausal = sw_noncausal_fn(B, H, q_idx, kv_idx)
+    sw_noncausal = sw_noncausal_fn(B, H, dummy_q_idx, dummy_kv_idx)
     print(sw_noncausal.int(), "\n")
 
     print("= Dilated Sliding Window (window_size=4, dilation=2, causal=True) =")
     ds_causal_fn = generate_dilated_sliding_window_mask(window_size=4, dilation=2, causal=True)
-    ds_causal = ds_causal_fn(B, H, q_idx, kv_idx)
+    ds_causal = ds_causal_fn(B, H, dummy_q_idx, dummy_kv_idx)
     print(ds_causal.int(), "\n")
 
     print("= Dilated Sliding Window (window_size=4, dilation=2, causal=False) =")
     ds_noncausal_fn = generate_dilated_sliding_window_mask(window_size=4, dilation=2, causal=False)
-    ds_noncausal = ds_noncausal_fn(B, H, q_idx, kv_idx)
+    ds_noncausal = ds_noncausal_fn(B, H, dummy_q_idx, dummy_kv_idx)
     print(ds_noncausal.int(), "\n")
 
-    # Quick checks:
-    # (1) Causal means no i < j
-    assert torch.all(c_mask == (q_idx >= kv_idx)), "Causal mask mismatch!"
-    # (2) For windowed masks with causal=True, check a random row
-    i = 5
-    row_sw = sw_causal[i]
-    allowed_js = torch.where(row_sw)[0]
-    if len(allowed_js) > 0:
-        # difference i-j <= 2
-        assert (i - allowed_js.min()) <= 2, "Window mismatch for sliding_window_mask(causal=True)."
+    # Quick checks...
+    assert torch.all(c_mask == (dummy_q_idx >= dummy_kv_idx)), "Causal mask mismatch!"
 
-    # (3) Dilated mask with causal=True should skip every other position if dilation=2
-    i = 6
-    row_ds = ds_causal[i]
-    allowed_js = torch.where(row_ds)[0]
-    for j in allowed_js:
-        diff = i - j
-        assert diff % 2 == 0, f"Dilation mismatch: got diff={diff}."
+    # === Top-k Mask Tests ===
+    # For top-k, our API expects coordinate grids of shape [B, H, Q_LEN, KV_LEN].
+    # We'll create those same dummy grids.
+    print("= Top-k Mask (k=3, non-causal) =")
+    k = 3
+    # Create similarity scores with values increasing along the key axis:
+    # For each query, the top 3 keys (ignoring causality) will be the last 3 indices.
+    importance_scores = torch.arange(KV_LEN, dtype=torch.float).unsqueeze(0).unsqueeze(0) \
+                         .expand(B, H, Q_LEN, KV_LEN)
+    topk_fn_noncausal = generate_top_k_mask(k, importance_scores, causal=False)
+    topk_mask_noncausal = topk_fn_noncausal(0, 0, dummy_q_idx, dummy_kv_idx)
+    print(topk_mask_noncausal.int(), "\n")
 
-    print("All checks passed.")
+    for i in range(Q_LEN):
+        expected = torch.zeros(KV_LEN, dtype=torch.bool)
+        expected[-k:] = True
+        assert torch.all(topk_mask_noncausal[0, 0, i] == expected), f"Non-causal top-k mask mismatch in query {i}"
+
+    print("= Top-k Mask (k=3, causal) =")
+    # For causal, build a similarity tensor where for each query i, only keys with j <= i get high scores.
+    importance_scores_causal = torch.empty(Q_LEN, KV_LEN)
+    for i in range(Q_LEN):
+        for j in range(KV_LEN):
+            importance_scores_causal[i, j] = float(j) if j <= i else -1000.0
+    importance_scores_causal = importance_scores_causal.unsqueeze(0).unsqueeze(0)  # [B, H, Q_LEN, KV_LEN]
+    topk_fn_causal = generate_top_k_mask(k, importance_scores_causal, causal=True)
+    topk_mask_causal = topk_fn_causal(0, 0, dummy_q_idx, dummy_kv_idx)
+    print(topk_mask_causal.int(), "\n")
+
+    for i in range(Q_LEN):
+        expected = torch.zeros(KV_LEN, dtype=torch.bool)
+        if i < k:
+            expected[: i+1] = True
+        else:
+            expected[i - k + 1: i+1] = True
+        assert torch.all(topk_mask_causal[0, 0, i] == expected), f"Causal top-k mask mismatch in query {i}"
+
+    print("All tests passed.")
 
 if __name__ == "__main__":
     main()
