@@ -17,12 +17,11 @@ from thesis.experiments.synthetics.args import args
 from thesis.utils.logger import logger
 from flash_attn import flash_attn_func
 from thesis.experiments.utils.assoc_scan.kernel import associative_scan
-
-# from transformers.modeling_outputs import CausalLMOutput
+from transformers.modeling_outputs import CausalLMOutput
 from fla.modules import FusedCrossEntropyLoss
 
 IGNORE_IDX = -100
-loss_fn = FusedCrossEntropyLoss(ignore_index=IGNORE_IDX)
+criterion = FusedCrossEntropyLoss(ignore_index=IGNORE_IDX)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
@@ -50,7 +49,6 @@ class MLP(nn.Module):
         self.w1 = nn.Linear(dim, inter_dim)
         self.w2 = nn.Linear(inter_dim, dim)
         self.w3 = nn.Linear(dim, inter_dim)
-        self.w2.SCALE_INIT = 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.gelu(self.w1(x), approximate="tanh") * self.w3(x))
@@ -460,8 +458,7 @@ class SimpleSpectralAttention(nn.Module):
         gate_values = torch.sigmoid(self.gate(x))  # (B, T, d)
 
         # Combine branches using element-wise gating
-        # -> x_tilde * (1 - gate_values) + y_attn * gate_values
-        y_combined = x_tilde + (y_attn - x_tilde) * gate_values
+        y_combined = torch.lerp(x_tilde, y_attn, gate_values)
 
         # Final projection and normalization
         return self.o_proj(y_combined)
@@ -491,7 +488,6 @@ class SpectralAttention(nn.Module):
         self.wk = nn.Linear(dim, dim)
         self.wv = nn.Linear(dim, dim)
         self.wo = nn.Linear(dim, dim)
-        self.wo.SCALE_INIT = 1
 
         if self.use_tensordot:
             self.tensordot_proj = nn.Linear(dim, dim)
@@ -503,7 +499,6 @@ class SpectralAttention(nn.Module):
 
         kv_initial_value = torch.ones((1, 1, 1, self.head_dim, self.head_dim))
         qk_initial_value = torch.ones((1, num_heads, 1)) / torch.sqrt(torch.tensor(float(self.head_dim)))
-
         self.kv_norm_scale = nn.Parameter(kv_initial_value)
         self.qk_norm_scale = nn.Parameter(qk_initial_value)
 
@@ -521,8 +516,8 @@ class SpectralAttention(nn.Module):
         tr_conv = lambda x, y: torchaudio.functional.fftconvolve(x, y)[: x.shape[0]]
         cconv = torch.vmap(tr_conv, in_dims=(0, 0), out_dims=0)
         hconv = lambda u1, f1: cconv(u1.permute(2, 0, 1), f1.permute(2, 0, 1)).T
-        hmap = torch.vmap(hconv, in_dims=(0, 0), out_dims=0)
-        bmap = torch.vmap(hmap, in_dims=(0, None), out_dims=0)
+        hmap = torch.vmap(hconv, in_axes=(0, 0), out_axes=0)
+        bmap = torch.vmap(hmap, in_axes=(0, None), out_axes=0)
         return bmap(u, reshaped(f))
 
     def bhld_convfft(self, v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
@@ -712,112 +707,59 @@ class Spectron(nn.Module):
         device=None,
     ):
         super().__init__()
-        self.seq_len = seq_len
-        self.d_model = d_model
-        self.k = k
-        self.num_heads = num_heads
-        self.vocab_size = vocab_size
-        self.num_layers = num_layers
-        self.use_hankel_L = use_hankel_L
-        self.use_tensordot = use_tensordot
-        self.r = r
-        self.device = device
 
+        self.vocab_size = vocab_size
         self.tok_emb = nn.Embedding(vocab_size, d_model)
+
+        self.in_dropout = nn.Dropout(dropout)
+        self.out_dropout = nn.Dropout(dropout)
+
         self.layers = nn.ModuleList(
             [
-                SpectralAttentionLayer(
-                    seq_len=seq_len,
-                    d_model=d_model,
-                    k=k,
-                    num_heads=num_heads,
-                    use_hankel_L=use_hankel_L,
-                    use_tensordot=use_tensordot,
-                    r=r,
-                    device=device,
-                )
+                SpectralAttentionLayer(seq_len, d_model, k, num_heads, use_hankel_L, use_tensordot, r, device=device)
                 for _ in range(num_layers)
             ]
         )
-        self.norm = nn.LayerNorm(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
-        # Optional: Weight tying
-        # self.tok_emb.weight = self.lm_head.weight
+        self.norm_f = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, d_model)
 
-        # Initialize weights
-        self.std = 1 / math.sqrt(d_model)
-        self.apply(self._init_weights)
-
-    def forward(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Forward pass of the Spectron model.
-
-        Args:
-            input_ids (torch.Tensor): Input tensor of shape (B, S).
-
-        Returns:
-            torch.Tensor: Logits tensor of shape (B, S, vocab_size).
-        """
-        _b, s = input_ids.shape
-        h = self.tok_emb(input_ids)  # (B, S, D)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.tok_emb(x)
 
         for layer in self.layers:
-            h = layer(h)  # Each layer expects/returns (B, S, D)
+            x = layer(x)
 
-        h = self.norm(h)  # (B, S, D)
-        logits = self.lm_head(h)  # (B, S, vocab_size)
+        x = self.norm_f(x)
+        logits = self.lm_head(x)
 
         return logits
-
-    def _init_weights(self, m):
-        std = self.std
-        if isinstance(m, nn.Linear):
-            if hasattr(m, "SCALE_INIT"):
-                std *= (2 * len(self.layers)) ** -0.5
-            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
-            if m.bias is not None:
-                torch.nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Embedding):
-            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
 
 
 # -----------------------------------------------------------------------------
 # Training and Evaluation Functions
 # -----------------------------------------------------------------------------
-def compute_metrics(model, loader, criterion, device=device):
+def compute_token_level_accuracy(model, loader, device=device):
     """
-    Compute average loss and token-level accuracy for a given dataloader.
-    Ignores target_ignore_idx (-100) in calculations.
+    Compute token-level accuracy while ignoring special tokens and target_ignore_idx.
+    This is a general metric that considers all valid positions.
     """
-    model.eval()  # Set model to evaluation mode
-    total_loss = 0.0
+    model.eval()
     correct_tokens = 0
     total_tokens = 0
-    num_batches = 0
-
     with torch.no_grad():
         for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
             logits = model(inputs)
-
-            # Calculate loss for the batch
-            # Note: Ensure criterion ignores the index correctly
-            loss = criterion(logits.view(-1, logits.size(-1)), targets.view(-1))
-            total_loss += loss.detach().item()
-
-            # Calculate accuracy for the batch
             predictions = logits.argmax(dim=-1)
-            valid_mask = targets != IGNORE_IDX  # Use the global IGNORE_IDX
+            valid_mask = targets != -100
             match = (predictions == targets) & valid_mask
-            correct_tokens += match.sum().detach().item()
-            total_tokens += valid_mask.sum().detach().item()
-            num_batches += 1
+            correct_tokens += match.sum().item()
+            total_tokens += valid_mask.sum().item()
 
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-    accuracy = 100.0 * correct_tokens / total_tokens if total_tokens > 0 else 0.0
-    model.train()  # Set model back to training mode
-    return avg_loss, accuracy
+    token_acc = 100.0 * correct_tokens / (total_tokens if total_tokens > 0 else 1)
+    print(f"Overall Token-Level Accuracy: {token_acc:.2f}%")
+    return token_acc
 
 
 def compute_recall_accuracy(model, loader, device=device):
@@ -841,8 +783,8 @@ def compute_recall_accuracy(model, loader, device=device):
 
             # Calculate accuracy only on recall positions
             match = (predictions == targets) & recall_positions
-            correct_recalls += match.sum().detach().item()
-            total_recalls += recall_positions.sum().detach().item()
+            correct_recalls += match.sum().item()
+            total_recalls += recall_positions.sum().item()
 
             # --- Debug Print for the first batch ---
             if i == 0 and not printed_batch:
@@ -875,126 +817,56 @@ def compute_recall_accuracy(model, loader, device=device):
     return recall_acc
 
 
-def train_model(model, train_loader, val_loader, max_steps: int = 10000, eval_interval: int = 50):
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-    model.train()  # Ensure model is in training mode
+@torch.compile(fullgraph=False)
+def optim_step(optimizer):
+    optimizer.step()
 
-    # History trackers
-    train_loss_history = []
-    train_acc_history = []
-    val_loss_history = []
-    val_acc_history = []
+
+def train_model(model, loader, val_loader, max_steps: int = 10000, eval_interval: int = 50):
+    optimizer = optim.AdamW(model.parameters(), lr=torch.tensor(args.lr))
+    model.train()
+    loss_history = []
+    accuracy_history = []
     eval_steps = []
-
     step = 0
-    # Use a single progress bar for steps
+    epoch = 0
+    latest_acc = 0.0
+
     desc = f"Training {model.__class__.__name__}"
     pbar = tqdm(total=max_steps, desc=desc)
 
-    # --- Variables for accumulating metrics between evaluations ---
-    current_train_loss = 0.0
-    current_correct_train_tokens = 0
-    current_total_train_tokens = 0
-    batches_since_last_eval = 0
-    # Initialize validation metrics for postfix display
-    last_val_loss = float("inf")
-    last_val_acc = 0.0
-    # ---
-
     while step < max_steps:
-        # No explicit epoch loop needed if max_steps is the limit
-        for inputs, targets in train_loader:  # targets here are inputs[1:] for training
+        epoch += 1
+        for inputs, targets in loader:
             if step >= max_steps:
                 break
 
             inputs = inputs.to(device)
-            targets = targets.to(device)  # These are the next-token targets
+            targets = targets.to(device)
 
-            # --- Training Step ---
             optimizer.zero_grad()
             logits = model(inputs)
-            loss = loss_fn(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = criterion(logits.flatten(0, 1), targets.flatten(0, 1))
             loss.backward()
-            # Optional: Gradient clipping
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            # --- End Training Step ---
+            optim_step(optimizer)
 
-            # --- Accumulate Training Metrics for Interval ---
-            current_train_loss += loss.detach().item()
-            with torch.no_grad():  # Accuracy calculation doesn't need gradients
-                predictions = logits.argmax(dim=-1)
-                valid_mask = targets != IGNORE_IDX
-                match = (predictions == targets) & valid_mask
-                current_correct_train_tokens += match.sum().detach().item()
-                current_total_train_tokens += valid_mask.sum().detach().item()
-            batches_since_last_eval += 1
-            # ---
-
+            total_loss = loss.detach().item()
+            loss_history.append(total_loss)
             step += 1
+
+            # Update progress bar
+            pbar.set_postfix(loss=f"{total_loss:.4f}", acc=f"{latest_acc:.2f}%")
             pbar.update(1)
 
-            # --- Update Postfix Every Step ---
-            running_avg_train_loss = (
-                current_train_loss / batches_since_last_eval if batches_since_last_eval > 0 else float("nan")
-            )
-            running_avg_train_acc = (
-                100.0 * current_correct_train_tokens / current_total_train_tokens
-                if current_total_train_tokens > 0
-                else float("nan")
-            )
-            pbar.set_postfix(
-                step=step,
-                trn_loss=f"{running_avg_train_loss:.3f}",
-                trn_acc=f"{running_avg_train_acc:.2f}%",
-                val_loss=f"{last_val_loss:.3f}",  # Show last known val metrics
-                val_acc=f"{last_val_acc:.2f}%",
-                refresh=False,  # Avoid potential flickering, update handled by interval
-            )
-            # ---
-
-            # --- Periodic Evaluation ---
-            if step % eval_interval == 0 or step == max_steps:
-                # Calculate final average training metrics for the interval
-                avg_train_loss = current_train_loss / batches_since_last_eval if batches_since_last_eval > 0 else 0.0
-                avg_train_acc = (
-                    100.0 * current_correct_train_tokens / current_total_train_tokens
-                    if current_total_train_tokens > 0
-                    else 0.0
-                )
-
-                # Calculate validation metrics
-                val_loss, val_acc = compute_metrics(model, val_loader, loss_fn, device)
-                last_val_loss = val_loss  # Update last known val metrics
-                last_val_acc = val_acc
-
-                # Store metrics for history plots
-                train_loss_history.append(avg_train_loss)
-                train_acc_history.append(avg_train_acc)
-                val_loss_history.append(val_loss)
-                val_acc_history.append(val_acc)
+            if step % eval_interval == 0:
+                acc = compute_token_level_accuracy(model, val_loader)
+                accuracy_history.append(acc)
                 eval_steps.append(step)
-
-                # Update progress bar postfix with final interval metrics
-                pbar.set_postfix(
-                    step=step,
-                    trn_loss=f"{avg_train_loss:.3f}",
-                    trn_acc=f"{avg_train_acc:.2f}%",
-                    val_loss=f"{val_loss:.3f}",
-                    val_acc=f"{val_acc:.2f}%",
-                    refresh=True,  # Force refresh now
-                )
-
-                # Reset accumulators for the next interval
-                current_train_loss = 0.0
-                current_correct_train_tokens = 0
-                current_total_train_tokens = 0
-                batches_since_last_eval = 0
-            # --- End Periodic Evaluation ---
+                latest_acc = acc
+                pbar.set_postfix(loss=f"{total_loss:.4f}", acc=f"{acc:.2f}%")
 
     pbar.close()
-    # Return all histories
-    return train_loss_history, train_acc_history, val_loss_history, val_acc_history, eval_steps
+    return loss_history, accuracy_history, eval_steps
 
 
 def show_example_predictions(model, model_name: str, dataset):
@@ -1038,7 +910,7 @@ if __name__ == "__main__":
     # Create data loaders using the registry
     print("Creating data loaders via registry...")
     loader, val_loader = registry.create_data_loaders(
-        task_name="mqar",
+        task_name="in_context_recall",
         batch_size=args.bsz,
         num_train=num_train,
         num_test=num_test,
@@ -1048,7 +920,7 @@ if __name__ == "__main__":
         # Task-specific arguments for single-query ICR:
         vocab_size=vocab_size,
         seq_len=seq_len,
-        # multi_query=True,  # Explicitly set to single-query
+        # multi_query=False,  # Explicitly set to single-query
         # Add other potential kwargs if needed, e.g., noise params if applicable
     )
     print("Data loaders created.")
@@ -1079,7 +951,7 @@ if __name__ == "__main__":
     for model_name, model in models_to_train:
         print(f"\nTraining {model_name}...")
         apply_compile(model)
-        tr_loss, tr_acc, v_loss, v_acc, steps = train_model(
+        loss_history, acc_history, eval_steps = train_model(
             model, loader, val_loader, max_steps=args.steps, eval_interval=args.eval
         )
         # Store results only if needed, otherwise just run training
@@ -1089,30 +961,29 @@ if __name__ == "__main__":
         print(f"\n--- Example Predictions for {model_name} ---")
         show_example_predictions(model, model_name, loader.dataset)
 
-    # Example adaptation if you uncomment plotting
-    if len(models_to_train) > 0:  # Check if models were trained
-        plt.style.use("seaborn-v0_8-darkgrid")
-        fig, axes = plt.subplots(2, 1, figsize=(10, 10), sharex=True)  # 2 rows: Loss, Accuracy
-
-        # Assuming only one model for simplicity, adapt if multiple
-        model_name = models_to_train[0][0]
-
-        # Plot Loss
-        axes[0].plot(steps, tr_loss, label=f"{model_name} Train Loss", color="tab:blue", alpha=0.8)
-        axes[0].plot(steps, v_loss, label=f"{model_name} Val Loss", color="tab:orange", linestyle="--")
-        axes[0].set_ylabel("Loss")
-        axes[0].set_title(f"Training & Validation Loss ({model_name})")
-        axes[0].legend()
-        axes[0].grid(True)
-
-        # Plot Accuracy
-        axes[1].plot(steps, tr_acc, label=f"{model_name} Train Acc", color="tab:blue", alpha=0.8)
-        axes[1].plot(steps, v_acc, label=f"{model_name} Val Acc", color="tab:orange", linestyle="--")
-        axes[1].set_xlabel("Step")
-        axes[1].set_ylabel("Accuracy (%)")
-        axes[1].set_title(f"Training & Validation Accuracy ({model_name})")
-        axes[1].legend()
-        axes[1].grid(True)
-
-        plt.tight_layout()
-        plt.show()
+    # Comment out plotting as we only train one model now
+    # if len(models_to_train) > 0 and len(results) > 0: # Plot if results were stored
+    #     plt.style.use("seaborn-v0_8-darkgrid")
+    #     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    #     model_name = list(results.keys())[0]
+    #     loss_history, acc_history, eval_steps = results[model_name]
+    #     # Plot training loss
+    #     ax1.plot(loss_history, label=model_name, color='green', alpha=0.7)
+    #     ax1.set_xlabel("Step")
+    #     ax1.set_ylabel("Cross-Entropy Loss")
+    #     ax1.set_title(f"Training Loss ({model_name})")
+    #     ax1.legend()
+    #     ax1.grid(True)
+    #     # Plot validation accuracy
+    #     ax2.plot(eval_steps, acc_history, label=model_name, color='green', marker='s')
+    #     ax2.set_xlabel("Step")
+    #     ax2.set_ylabel("Token-Level Accuracy (%)")
+    #     ax2.set_title(f"Validation Accuracy ({model_name})")
+    #     ax2.legend()
+    #     ax2.grid(True)
+    #     # Add final accuracy text box
+    #     final_acc_text = f"Final Accuracy:\n{model_name}: {acc_history[-1]:.2f}%"
+    #     props = dict(boxstyle="round", facecolor="wheat", alpha=0.5)
+    #     ax2.text(1.05, 0.95, final_acc_text, transform=ax2.transAxes, fontsize=10, verticalalignment="top", bbox=props)
+    #     plt.tight_layout()
+    #     plt.show()
