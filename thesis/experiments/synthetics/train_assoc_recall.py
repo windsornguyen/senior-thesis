@@ -20,7 +20,7 @@ from torch.nn.functional import scaled_dot_product_attention as sdpa
 from torchtune.modules import RotaryPositionalEmbeddings as RoPE
 # from flash_attn.layers.rotary import RotaryEmbedding as RoPE
 
-from thesis.experiments.synthetics.assoc_recall import generate_assoc_recall
+from thesis.experiments.synthetics.assoc_recall import generate_in_context_recall_instance
 from thesis.experiments.synthetics.args import args
 
 # from flash_attn import flash_attn_func, flash_attn_qkvpacked_func
@@ -125,7 +125,7 @@ class Transformer(nn.Module):
         self.lm_head = nn.Linear(args.dim, args.vocab_size, bias=args.bias)
 
         self.std = args.dim**-0.5
-        self.apply(self._init_weights)
+        self.apply(self.init_weights)
         print("Model Parameter Count: %.2fM\n" % (self._get_num_params() / 1e6,))
         print(self.eval())
 
@@ -137,7 +137,7 @@ class Transformer(nn.Module):
 
         return self.lm_head(self.out_norm(x))
 
-    def _init_weights(self, module):
+    def init_weights(self, module):
         if isinstance(module, nn.Linear):
             if hasattr(module, "SCALE_INIT"):
                 self.std *= (2 * self.num_layers) ** -0.5
@@ -199,7 +199,7 @@ def get_spectral_filters(
     sigma_k, phi_k = sigma[-K:], phi[:, -K:]
     epsilon = 1e-9
     sigma_k = sigma_k.clamp_min(epsilon)
-    phi_k = phi_k * sigma_k**0.25
+    # phi_k = phi_k * sigma_k**0.25
     return phi_k.to(device=device, dtype=dtype)
 
 
@@ -981,7 +981,7 @@ class Spectron(nn.Module):
         self.out_proj = nn.Linear(config.dim, config.d_out)
 
         self.std = config.dim**-0.5
-        self.apply(self._init_weights)
+        self.apply(self.init_weights)
         print("Model Parameter Count: %.2fM\n" % (self._get_num_params() / 1e6,))
         print(self.eval())
 
@@ -1002,24 +1002,16 @@ class Spectron(nn.Module):
         out = self.out_proj(x)
         return out
 
-    def _init_weights(self, module):
+    def init_weights(self, module):
+        std = self.std
         if isinstance(module, nn.Linear):
             if hasattr(module, "SCALE_INIT"):
-                self.std *= (2 * self.num_layers) ** -0.5
-            torch.nn.init.normal_(module.weight, mean=0.0, std=self.std)
+                std *= (2 * self.num_layers) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=self.std)
-        elif isinstance(module, SpectralAttention):
-            if self.use_tensordot:
-                torch.nn.init.xavier_normal_(module.M_inputs)
-                torch.nn.init.xavier_normal_(module.M_conv)
-                torch.nn.init.xavier_normal_(module.M_filters)
-            else:
-                torch.nn.init.xavier_normal_(module.M_phi_plus)
-                if not self.use_hankel_L:
-                    torch.nn.init.xavier_normal_(module.M_phi_minus)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def _get_num_params(self):
         n_params = sum(p.numel() for p in self.parameters())
@@ -1267,7 +1259,7 @@ class FlashSTU(nn.Module):
             self.tok_emb.weight = self.lm_head.weight
 
         self.std = config.dim**-0.5
-        self.apply(self._init_weights)
+        self.apply(self.init_weights)
         print("Model Parameter Count: %.2fM\n" % (self._get_num_params() / 1e6,))
         print(self.eval())
 
@@ -1287,7 +1279,7 @@ class FlashSTU(nn.Module):
             n_params -= self.pos_emb.weight.numel()
         return n_params
 
-    def _init_weights(self, module):
+    def init_weights(self, module):
         if isinstance(module, nn.Linear):
             if hasattr(module, "SCALE_INIT"):
                 self.std *= (2 * self.num_layers) ** -0.5
@@ -1500,7 +1492,7 @@ class SparseFlashSTU(nn.Module):
             self.tok_emb.weight = self.lm_head.weight
 
         self.std = config.dim**-0.5
-        self.apply(self._init_weights)
+        self.apply(self.init_weights)
         print("Model Parameter Count: %.2fM\n" % (self._get_num_params() / 1e6,))
         print(self.eval())
 
@@ -1520,7 +1512,7 @@ class SparseFlashSTU(nn.Module):
             n_params -= self.pos_emb.weight.numel()
         return n_params
 
-    def _init_weights(self, module):
+    def init_weights(self, module):
         if isinstance(module, nn.Linear):
             if hasattr(module, "SCALE_INIT"):
                 self.std *= (2 * self.num_layers) ** -0.5
@@ -1713,6 +1705,19 @@ def train_model(
 ):
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    def create_lr_lambda(warmup_steps: int, max_steps: int, max_lr: float, min_lr: float):
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                lr = min_lr + (max_lr - min_lr) * step / warmup_steps
+            else:
+                lr = max_lr - (max_lr - min_lr) * (step - warmup_steps) / max(max_steps - warmup_steps, 1)
+            return lr / max_lr
+
+        return lr_lambda
+
+    lr_lambda_fn = create_lr_lambda(max_steps * 0.1, max_steps, args.lr, args.lr * 0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda_fn)
+
     model.train()
     loss_history = []
     accuracy_history = []
@@ -1737,6 +1742,7 @@ def train_model(
             loss = criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             total_loss = loss.item()
             loss_history.append(total_loss)

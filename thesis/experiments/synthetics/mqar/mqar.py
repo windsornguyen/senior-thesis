@@ -136,15 +136,15 @@ from torch.utils.data import TensorDataset
 
 def generate_mqar(
     num_examples: int = 100000,
-    sequence_len: int = 512,
+    seq_len: int = 512,
     vocab_size: int = 8192,  # Must be even.
     num_pairs: int = 64,
     alpha: float = 2.0,
     seed: int = 1746,
 ) -> TensorDataset:
-    assert sequence_len % 2 == 0, f"sequence_len must be even, got {sequence_len}"
-    assert vocab_size > sequence_len, f"vocab_size must be greater than sequence_len, got {vocab_size} and {sequence_len}"
-    assert num_pairs * 4 <= sequence_len, f"sequence_len must be >= 4 * num_pairs, got {sequence_len} and {num_pairs}"
+    assert seq_len % 2 == 0, f"sequence_len must be even, got {seq_len}"
+    assert vocab_size > seq_len, f"vocab_size must be greater than sequence_len, got {vocab_size} and {seq_len}"
+    assert num_pairs * 4 <= seq_len, f"sequence_len must be >= 4 * num_pairs, got {seq_len} and {num_pairs}"
 
     torch.manual_seed(seed)
 
@@ -172,7 +172,7 @@ def generate_mqar(
     kvs[:, 1::2] = values
 
     # Compute power-law distribution for query gaps.
-    space = (sequence_len - context_size) // 2  # available gap positions
+    space = (seq_len - context_size) // 2  # available gap positions
     r = torch.arange(1, space + 1, dtype=torch.float)
     p = alpha * (r ** (alpha - 1))
     p /= p.sum()  # normalize
@@ -183,7 +183,7 @@ def generate_mqar(
     gaps = torch.multinomial(p_batch, num_samples=num_pairs, replacement=False)  # shape: [num_examples, num_pairs]
     
     # Build queries tensor: length is (sequence_len - context_size + 1)
-    queries_len = sequence_len - context_size + 1
+    queries_len = seq_len - context_size + 1
     queries = torch.zeros(num_examples, queries_len, dtype=torch.long)
     # Compute target indices: gaps are multiplied by 2.
     target_indices = gaps * 2
@@ -194,7 +194,7 @@ def generate_mqar(
     examples = torch.cat([kvs, queries], dim=1)
 
     # Prepare labels: initialize with ignore value (-100).
-    labels_full = torch.full((num_examples, sequence_len + 1), -100, dtype=torch.long)
+    labels_full = torch.full((num_examples, seq_len + 1), -100, dtype=torch.long)
     # Determine positions for placing the values: shift indices by context_size + 1.
     label_indices = target_indices + context_size + 1
     labels_full.scatter_(1, label_indices, values)

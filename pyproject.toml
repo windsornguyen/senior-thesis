@@ -3,7 +3,7 @@ name = "thesis"
 version = "0.0.1"
 description = "Windsor Nguyen's Senior Thesis"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = {file = "LICENSE"}
 
 authors = [
@@ -45,12 +45,7 @@ dependencies = [
     "wandb>=0.19.0",
     "psutil>=6.0.0",
     "matplotlib>=3.9.2",
-    "ipykernel>=6.29.5",
     "colorama>=0.4.6",
-    "orjson>=3.10.12",
-    "pynvml>=12.0.0",
-    "nvidia-ml-py>=12.570.86",
-    "plotly>=6.0.0",
     # "kaleido==0.2.1.post1",
 ]
 

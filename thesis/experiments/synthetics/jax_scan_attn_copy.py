@@ -1,7 +1,7 @@
 import inspect
 import dataclasses
 from functools import wraps
-from typing import Tuple, Any
+from typing import Tuple, Union
 import jax.scipy as jsp
 import matplotlib
 import matplotlib.pyplot as plt
@@ -458,13 +458,96 @@ def conv(filters: jnp.ndarray, keys: jnp.ndarray) -> jnp.ndarray:
 
 #         return output
 
+# class ScanAttention(nn.Module):
+#     dim: int
+#     num_heads: int
+#     seq_len: int
+#     spectral_basis: jnp.ndarray
+#     eps: float = 1e-5
+
+#     def setup(self):
+#         self.head_dim = self.dim // self.num_heads
+#         self.wq = nn.Dense(self.dim)
+#         self.wk = nn.Dense(self.dim)
+#         self.wv = nn.Dense(self.dim)
+#         self.wo = nn.Dense(self.dim)
+#         # Gating projection: maps [D/H * D/H] to [1]
+#         self.gate_proj = nn.Dense(1)
+#         self.beta = self.param("beta", lambda rng: jnp.array(1.0))
+
+#     def softplus(self, x, beta=1.0):
+#         return (1.0 / beta) * jnp.log1p(jnp.exp(beta * x))
+
+#     def __call__(self, x, training=False):
+#         batch_size, seq_len, _ = x.shape
+
+#         # Compute QKV projections
+#         q = self.wq(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+#         k = self.wk(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+#         v = self.wv(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+
+#         # Transpose for bmm
+#         q = q.transpose(0, 2, 1, 3)
+#         k = k.transpose(0, 2, 1, 3) / jnp.sqrt(self.head_dim)
+#         v = v.transpose(0, 2, 1, 3)
+
+#         # Spectral basis
+#         k = conv(self.spectral_basis, k)
+#         v = conv(self.spectral_basis, v)
+
+#         # Compute pairwise interactions via outer product
+#         # Z: [B, H, S, D/H, D/H]
+#         Z = jnp.einsum("bhsd,bhse->bhsde", v, k)
+
+#         # Compute gates
+#         # Z: [B, H, S, D/H, D/H]
+#         gate_input = Z.reshape(*Z.shape[:3], -1)  # [B, H, S, (D/H)^2]
+#         gates_logits = self.gate_proj(gate_input)  # [B, H, S, 1]
+#         gates = jax.nn.relu(gates_logits) ** 2 + self.eps  # [B, H, S, 1]
+#         gates = gates[..., None]  # [B, H, S, 1, 1]
+
+#         # Prepare inputs for associative scan by gating Z
+#         gated_Z = gates * Z  # [B, H, S, D/H, D/H]
+
+#         # Define the associative addition operation
+#         def combine_fn(carry, next_val):
+#             sum_gated_Z, sum_gates = carry
+#             next_gated_Z, next_gates = next_val
+#             return (sum_gated_Z + next_gated_Z, sum_gates + next_gates)
+
+#         # Build a cumulative memory across the sequence dimension
+#         cumulative_gated_Z, cumulative_gates = jax.lax.associative_scan(combine_fn, (gated_Z, gates), axis=2)
+
+#         # Normalize to obtain causal attention weights.
+#         attn_weights = cumulative_gated_Z / (cumulative_gates + self.eps)
+
+#         # Compute raw output by applying the attention weights to the query.
+#         output_raw = jnp.einsum("bhsd,bhsde->bhse", q, attn_weights)
+
+#         # Normalize the raw output onto the unit sphere for stability.
+#         output_norm = jnp.linalg.norm(output_raw, axis=3, keepdims=True)
+#         output_normalized = output_raw / jnp.maximum(output_norm, self.eps)
+
+#         # Rearrange dimensions and apply the final projection.
+#         output_normalized = output_normalized.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.dim)
+#         output = self.wo(output_normalized)
+
+#         return output
+
+def normalize(input: jnp.ndarray, 
+              p: float = 2.0, 
+              dim: Union[int, Tuple[int, ...]] = 1, 
+              eps: float = 1e-12) -> jnp.ndarray:
+    norm = jnp.linalg.norm(input, ord=p, axis=dim, keepdims=True)
+    return input / jnp.maximum(norm, eps)
+
 class ScanAttention(nn.Module):
     dim: int
     num_heads: int
     seq_len: int
     spectral_basis: jnp.ndarray
     eps: float = 1e-5
-
+    
     def setup(self):
         self.head_dim = self.dim // self.num_heads
         self.wq = nn.Dense(self.dim)
@@ -473,63 +556,120 @@ class ScanAttention(nn.Module):
         self.wo = nn.Dense(self.dim)
         # Gating projection: maps [D/H * D/H] to [1]
         self.gate_proj = nn.Dense(1)
-        self.beta = self.param("beta", lambda rng: jnp.array(1.0))
+        self.kv_norm_scale = self.param(
+            "kv_norm_scale",
+            lambda rng: jnp.ones((1, self.num_heads, 1, self.head_dim, self.head_dim))
+        )
 
-    def softplus(self, x, beta=1.0):
-        return (1.0 / beta) * jnp.log1p(jnp.exp(beta * x))
+    def combine_fn(self, x, y):
+            """
+            Combines two leaves for gated causal attention with online softmax.
+            Each leaf is a tuple:
+            (m, s, n, Z, g)
+            where:
+            m: the score/logit for numerical stability
+            s: running sum of exp(score-m)
+            n: running sum of exp(score-m)*value
+            Z: the outer product interaction matrix
+            g: the gate value
+            """
+            m_x, s_x, n_x, Z_x, g_x = x
+            m_y, s_y, n_y, Z_y, g_y = y
+            
+            # Compute new maximum
+            m_new = jnp.maximum(m_x, m_y)
+            
+            # Scale factors
+            exp_x = jnp.exp(m_x - m_new)
+            exp_y = jnp.exp(m_y - m_new)
+            
+            # Update softmax components
+            s_new = s_x * exp_x + s_y * exp_y
+            n_new = n_x * exp_x[..., None] + n_y * exp_y[..., None]
+            
+            # Update gated Z and gate accumulation
+            Z_new = Z_x + Z_y
+            g_new = g_x + g_y
+            
+            return (m_new, s_new, n_new, Z_new, g_new)
+    
+    def scan_fn(self, qk_slice, v_slice, Z_slice, g_slice):
+        """Process a single (batch, head) slice"""
+        # Set up leaf elements
+        # qk_slice: [L], v_slice: [L, h], Z_slice: [L, h, h], g_slice: [L, 1, 1]
+        leaves_m = qk_slice                  # [L]
+        leaves_s = jnp.ones_like(qk_slice)   # [L]
+        leaves_n = v_slice                   # [L, h]
+        leaves_Z = Z_slice                   # [L, h, h]
+        leaves_g = g_slice                   # [L, 1, 1]
+
+        leaves = (leaves_m, leaves_s, leaves_n, leaves_Z, leaves_g)
+        return jax.lax.associative_scan(self.combine_fn, leaves, axis=0)
 
     def __call__(self, x, training=False):
-        batch_size, seq_len, _ = x.shape
-
+        B, L, D = x.shape
+        H, h = self.num_heads, self.head_dim
+        
         # Compute QKV projections
-        q = self.wq(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = self.wk(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = self.wv(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        q = self.wq(x).reshape(B, L, H, h)
+        k = self.wk(x).reshape(B, L, H, h)
+        v = self.wv(x).reshape(B, L, H, h)
+        
+        # Transpose for better memory layout
+        q = q.transpose(0, 2, 1, 3)  # [B, H, L, h]
+        k = k.transpose(0, 2, 1, 3)  # [B, H, L, h]
+        v = v.transpose(0, 2, 1, 3)  # [B, H, L, h]
 
-        # Transpose for bmm
-        q = q.transpose(0, 2, 1, 3)
-        k = k.transpose(0, 2, 1, 3) / jnp.sqrt(self.head_dim)
-        v = v.transpose(0, 2, 1, 3)
+        sim = jnp.einsum("bhld,bhld->bhl", q, k)
 
-        # Spectral basis
+        # KV norm (QK norm analog)
+        k = normalize(k, p=2.0, dim=-1, eps=self.eps)
+        v = normalize(v, p=2.0, dim=-1, eps=self.eps)
+
+        # Apply spectral basis
         k = conv(self.spectral_basis, k)
         v = conv(self.spectral_basis, v)
 
         # Compute pairwise interactions via outer product
-        # Z: [B, H, S, D/H, D/H]
-        Z = jnp.einsum("bhsd,bhse->bhsde", v, k)
+        Z = jnp.einsum("bhld,bhle->bhlde", v, k)
+        Z = Z * self.kv_norm_scale
 
         # Compute gates
-        # Z: [B, H, S, D/H, D/H]
-        gate_input = Z.reshape(*Z.shape[:3], -1)  # [B, H, S, (D/H)^2]
-        gates_logits = self.gate_proj(gate_input)  # [B, H, S, 1]
-        gates = jax.nn.relu(gates_logits) ** 2 + self.eps  # [B, H, S, 1]
-        gates = gates[..., None]  # [B, H, S, 1, 1]
+        gate_input = Z.reshape(*Z.shape[:3], -1)  # [B, H, L, h²]
+        gates_logits = self.gate_proj(gate_input)  # [B, H, L, 1]
+        gates = jax.nn.relu(gates_logits) ** 2 + self.eps  # [B, H, L, 1]
+        gates = gates[..., None]  # [B, H, L, 1, 1]
 
-        # Prepare inputs for associative scan by gating Z
-        gated_Z = gates * Z  # [B, H, S, D/H, D/H]
+        # Apply gating to Z
+        gated_Z = gates * Z  # [B, H, L, h, h]
 
-        # Define the associative addition operation
-        def combine_fn(carry, next_val):
-            sum_gated_Z, sum_gates = carry
-            next_gated_Z, next_gates = next_val
-            return (sum_gated_Z + next_gated_Z, sum_gates + next_gates)
+        # Vmap over the head dimension (for a single batch)
+        batch_scan_fn = jax.vmap(self.scan_fn, in_axes=(0, 0, 0, 0))
 
-        # Build a cumulative memory across the sequence dimension
-        cumulative_gated_Z, cumulative_gates = jax.lax.associative_scan(combine_fn, (gated_Z, gates), axis=2)
+        # Vmap over the batch dimension
+        batched_scan_fn = jax.vmap(batch_scan_fn, in_axes=(0, 0, 0, 0))
 
-        # Normalize to obtain causal attention weights.
-        attn_weights = cumulative_gated_Z / (cumulative_gates + self.eps)
+        # Run the scan over all dimensions at once
+        m_scan, s_scan, n_scan, Z_scan, g_scan = batched_scan_fn(sim, v, gated_Z, gates)
 
-        # Compute raw output by applying the attention weights to the query.
-        output_raw = jnp.einsum("bhsd,bhsde->bhse", q, attn_weights)
+        # --- Compute the final attention outputs ---
 
-        # Normalize the raw output onto the unit sphere for stability.
-        output_norm = jnp.linalg.norm(output_raw, axis=3, keepdims=True)
-        output_normalized = output_raw / jnp.maximum(output_norm, self.eps)
+        # 1. Compute the normalized online softmax weights
+        # [B, H, L, 1, 1]
+        softmax_weights = jnp.exp(sim - m_scan)[..., None, None] \
+                        / (s_scan[..., None, None] + self.eps)
 
-        # Rearrange dimensions and apply the final projection.
-        output_normalized = output_normalized.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.dim)
+        # 2. Gated accumulation normalization
+        gated_weights = Z_scan / (g_scan + self.eps)
+
+        # Multiplicatively modulate the gated weights with the softmax weights
+        attn_weights = gated_weights * (1.0 + jax.nn.silu(softmax_weights))
+
+        # Query from the attention weights
+        ctxt = jnp.einsum("bhld,bhlde->bhle", q, attn_weights)  # [B, H, L, h]
+
+        # Reshape and project
+        output_normalized = ctxt.transpose(0, 2, 1, 3).reshape(B, L, D)
         output = self.wo(output_normalized)
 
         return output

@@ -32,6 +32,7 @@ torch.set_float32_matmul_precision("high")
 IGNORE_IDX = -1
 SEED = 1746
 
+
 def generate_induction_heads(
     num_examples: int = 5,
     sequence_len: int = 30,
@@ -46,6 +47,7 @@ def generate_induction_heads(
     inputs[torch.arange(num_examples), -1] = special
     targets = inputs[torch.arange(num_examples), idx + 1]
     return TensorDataset(inputs, targets)
+
 
 sample_loader = generate_induction_heads(num_examples=3, sequence_len=24, vocab_size=3)
 for batch_ndx, sample in enumerate(sample_loader):
@@ -68,65 +70,90 @@ class MLP(nn.Module):
         x = self.w2(x)
         return x
 
-
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads, seq_len) -> None:
+    def __init__(self, dim, num_heads, seq_len, kernel_size: int = 3, use_conv: bool = True) -> None:
         super().__init__()
         self.dim = dim
         self.H = num_heads
         self.h = dim // num_heads
         self.seq_len = seq_len
         self.scale = self.h**-0.5
+        self.use_conv = use_conv
 
         # Create causal mask
         mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
         self.register_buffer("mask", mask.view(1, 1, seq_len, seq_len))
 
+        # Linear projections for Q, K, V
         self.wq = nn.Linear(dim, dim, bias=False)
         self.wk = nn.Linear(dim, dim, bias=False)
         self.wv = nn.Linear(dim, dim, bias=False)
         self.wo = nn.Linear(dim, dim, bias=False)
 
+        # Depthwise 1D convolutions for Q, K, V (only if use_conv is True)
+        if self.use_conv:
+            padding = (kernel_size - 1) // 2
+            self.conv_q = nn.Conv1d(in_channels=dim, out_channels=dim, kernel_size=kernel_size, padding=padding, groups=dim)
+            self.conv_k = nn.Conv1d(in_channels=dim, out_channels=dim, kernel_size=kernel_size, padding=padding, groups=dim)
+            self.conv_v = nn.Conv1d(in_channels=dim, out_channels=dim, kernel_size=kernel_size, padding=padding, groups=dim)
+
     def forward(self, x):
         B, L, D = x.shape
+
+        # Compute Q, K, V
         q, k, v = self.wq(x), self.wk(x) * self.scale, self.wv(x)
-        q = q.view(B, L, self.H, self.h).transpose(1, 2)
+
+        # Apply depthwise convolution if use_conv is True
+        if self.use_conv:
+            q = q.permute(0, 2, 1)  # [B, D, L]
+            k = k.permute(0, 2, 1)
+            v = v.permute(0, 2, 1)
+
+            q = self.conv_q(q).permute(0, 2, 1)  # [B, L, D]
+            k = self.conv_k(k).permute(0, 2, 1)
+            v = self.conv_v(v).permute(0, 2, 1)
+
+        # Reshape for multi-head attention
+        q = q.view(B, L, self.H, self.h).transpose(1, 2)  # [B, H, L, h]
         k = k.view(B, L, self.H, self.h).transpose(1, 2)
         v = v.view(B, L, self.H, self.h).transpose(1, 2)
-        sim = q @ k.transpose(-2, -1)
+
+        # Compute attention scores
+        sim = q @ k.transpose(-2, -1)  # [B, H, L, L]
 
         # Apply causal mask
         sim = sim.masked_fill(self.mask, float("-inf"))
 
         attn = F.softmax(sim, dim=-1)
-        ctxt = attn @ v
-        out = ctxt.transpose(1, 2).reshape(B, L, -1)
+        ctxt = attn @ v  # [B, H, L, h]
+        out = ctxt.transpose(1, 2).reshape(B, L, -1)  # [B, L, D]
         out = self.wo(out)
-        return out
+        return out, attn
 
 
 class AttentionLayer(nn.Module):
-    def __init__(self, dim, num_heads, seq_len) -> None:
+    def __init__(self, dim, num_heads, seq_len, kernel_size: int = 3, use_conv: bool = True) -> None:
         super().__init__()
-        self.attn = Attention(dim, num_heads, seq_len)
+        self.attn = Attention(dim, num_heads, seq_len, kernel_size=kernel_size, use_conv=use_conv)
         self.norm = nn.LayerNorm(dim)
         self.mlp = MLP(dim, 4 * dim)
         self.mlp_norm = nn.LayerNorm(dim)
 
     def forward(self, x):
-        x = x + self.attn(self.norm(x))
+        attn_out, attn_weights = self.attn(self.norm(x))
+        x = x + attn_out
         # x = x + self.mlp(self.mlp_norm(x))
-        return x
+        return x, attn_weights
 
 
 class Transformer(nn.Module):
-    def __init__(self, dim, num_heads, num_layers, seq_len, vocab_size) -> None:
+    def __init__(self, dim, num_heads, num_layers, seq_len, vocab_size, kernel_size: int = 3, use_conv: bool = True) -> None:
         super().__init__()
         self.pos_emb = nn.Embedding(seq_len, dim)
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
-            attn_layer = AttentionLayer(dim, num_heads, seq_len)
+            attn_layer = AttentionLayer(dim, num_heads, seq_len, kernel_size=kernel_size, use_conv=use_conv)
             self.layers.append(attn_layer)
         self.norm_f = nn.LayerNorm(dim)
         self.out = nn.Linear(dim, vocab_size, bias=False)
@@ -138,21 +165,14 @@ class Transformer(nn.Module):
         tok_emb = self.tok_emb(x)  # [B, L, D]
         x = pos_emb + tok_emb
 
+        attn_weights_list = []
         for layer in self.layers:
-            x = layer(x)
+            x, attn_weights = layer(x)
+            attn_weights_list.append(attn_weights)
 
         x = self.norm_f(x)
         out = self.out(x)
-        return out
-
-
-B, L = 1, 4
-V = 16
-
-model = Transformer(dim=8, num_heads=2, num_layers=2, seq_len=L, vocab_size=V)
-x = torch.randint(0, V, (B, L))
-preds = model(x)
-
+        return out, attn_weights_list
 
 # Utility functions
 def create_lr_lambda(warmup_steps: int, max_steps: int, max_lr: float, min_lr: float):
@@ -173,7 +193,7 @@ def compute_acc(model, loader, device=None):
     with torch.no_grad():
         for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            logits = model(inputs)
+            logits, _ = model(inputs)
             predictions = logits[:, -1, :].argmax(dim=-1)
             correct_tokens += (predictions == targets).sum().item()
             total_tokens += targets.size(0)
@@ -181,27 +201,84 @@ def compute_acc(model, loader, device=None):
     model.train()
     return 100.0 * correct_tokens / total_tokens
 
+
+def plot_attention_heatmap(attn_weights_list, layer_idx, head_idx, seq_len, example_idx=0, inputs=None, target=None):
+    """
+    Plots the attention heatmap for a given layer and head.
+
+    Instead of including inputs and targets in the title,
+    this version adds a textbox below the plot.
+
+    Args:
+        attn_weights_list: List of attention weights from each layer.
+        layer_idx: Index of the layer to visualize.
+        head_idx: Index of the attention head to visualize.
+        seq_len: Sequence length.
+        example_idx: Index of the example in the batch to visualize (default: 0).
+        inputs: Input sequence for the example (optional, for annotation).
+        target: Target token for the example (optional, for annotation).
+    """
+    # Extract attention weights for the specified layer, example, and head.
+    attn_weights = (
+        attn_weights_list[layer_idx][example_idx, head_idx].cpu().detach().numpy()
+    )  # shape: [seq_len, seq_len]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(attn_weights, cmap="viridis", aspect="auto")
+    ax.set_xlabel("Key Positions")
+    ax.set_ylabel("Query Positions")
+
+    # Add a colorbar.
+    plt.gcf().colorbar(im, ax=ax, label="Attention Weight")
+
+    # Set a concise title with layer and head info.
+    ax.set_title(f"Layer {layer_idx + 1}, Head {head_idx + 1}", fontsize=12)
+
+    # If inputs and target are provided, add them as a textbox below the plot.
+    if inputs is not None and target is not None:
+        input_str = " ".join(map(str, inputs[example_idx].cpu().numpy()))
+        target_str = str(target[example_idx].cpu().item())
+        info_text = f"Input: [{input_str}]\nTarget: {target_str}"
+        plt.gcf().text(
+            0.5,
+            0.01,
+            info_text,
+            fontsize=10,
+            ha="center",
+            va="bottom",
+            bbox=dict(facecolor="white", alpha=0.5, edgecolor="gray"),
+        )
+
+    # Adjust layout to leave space for the textbox.
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
+    plt.show()
+
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Parameters
 E = 1000
 L = 32
 V = 16
-dim = 128
-num_heads = 2
-num_layers = 2
+dim = 8
+num_heads = 4
+num_layers = 1
+kernel_size = 3
+use_conv = True
 DELIMS = 3
 
 # Create datasets
 train_dataset = generate_induction_heads(num_examples=E, sequence_len=L, vocab_size=V, seed=SEED)
-val_dataset = generate_induction_heads(num_examples=E // 10, sequence_len=L, vocab_size=V, seed=SEED+1)  # Different seed for val
+val_dataset = generate_induction_heads(
+    num_examples=E // 10, sequence_len=L, vocab_size=V, seed=SEED + 1
+)  # Different seed for val
 
 batch_size = 32
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
 # Initialize model
-model = Transformer(dim=dim, num_heads=num_heads, num_layers=num_layers, seq_len=L, vocab_size=V+DELIMS)
+model = Transformer(dim=dim, num_heads=num_heads, num_layers=num_layers, seq_len=L, vocab_size=V + DELIMS, kernel_size=kernel_size, use_conv=use_conv)
 model.to(device)
 
 # Set up training components
@@ -231,7 +308,11 @@ examples_seen = 0
 epochs_completed = 0
 reached_90 = False
 
-pbar = tqdm(total=max_steps, desc="Training", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]")
+pbar = tqdm(
+    total=max_steps,
+    desc="Training",
+    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+)
 
 model.train()
 train_iter = iter(train_loader)
@@ -250,7 +331,7 @@ while curr_step < max_steps:
     inputs, targets = inputs.to(device), targets.to(device)
 
     optimizer.zero_grad()
-    logits = model(inputs)
+    logits, attn_weights_list = model(inputs)
     last_logits = logits[:, -1, :]
     loss = loss_fn(last_logits, targets)
     loss.backward()
@@ -267,7 +348,9 @@ while curr_step < max_steps:
         eval_steps.append(curr_step)
         running_acc = acc
         if not reached_90 and acc >= 90.0:
-            print(f"Reached 90% accuracy at step {curr_step}, examples seen: {examples_seen}, epochs: {epochs_completed}")
+            print(
+                f"Reached 90% accuracy at step {curr_step}, examples seen: {examples_seen}, epochs: {epochs_completed}"
+            )
             reached_90 = True
 
     pbar.set_postfix(
@@ -276,7 +359,7 @@ while curr_step < max_steps:
         acc=f"{running_acc:.1f}%",
         lr=f"{scheduler.get_last_lr()[0]:.1e}",
         ex=f"{examples_seen//1000}k",
-        ep=f"{epochs_completed}"
+        ep=f"{epochs_completed}",
     )
     pbar.update(1)
 
@@ -288,6 +371,24 @@ print(f"Total examples seen: {examples_seen}")
 print(f"Epochs completed: {epochs_completed}")
 
 # Plotting
+model.eval()
+with torch.no_grad():
+    val_inputs, val_targets = next(iter(val_loader))
+    val_inputs, val_targets = val_inputs.to(device), val_targets.to(device)
+    logits, attn_weights_list = model(val_inputs)
+
+    # Visualize attention for each layer and head
+    for layer_idx in range(len(attn_weights_list)):
+        for head_idx in range(num_heads):
+            plot_attention_heatmap(
+                attn_weights_list,
+                layer_idx=layer_idx,
+                head_idx=head_idx,
+                seq_len=L,
+                inputs=val_inputs,
+                target=val_targets,
+            )
+
 plt.figure(figsize=(12, 5))
 plt.subplot(1, 2, 1)
 plt.plot(loss_history, label="Training Loss")

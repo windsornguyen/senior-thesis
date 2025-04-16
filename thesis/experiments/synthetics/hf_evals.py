@@ -163,6 +163,14 @@ def main():
 
     model_configs = [
         ModelConfig(
+            name="FlashSTU",
+            checkpoint="Hazan-Lab/Flash_STU_550M",
+            model_class=AutoModelForCausalLM,
+            tokenizer_class=AutoTokenizer,
+            dtype=dtype,
+            device=device,
+        ),
+        ModelConfig(
             name="SmolLM-360M",
             checkpoint="HuggingFaceTB/SmolLM-360M",
             model_class=AutoModelForCausalLM,

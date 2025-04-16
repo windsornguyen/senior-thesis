@@ -657,11 +657,11 @@ class SpectralAttention(nn.Module):
         self.stu_filters = get_spectral_filters(seq_len, k, use_hankel_L, device, dtype)
 
         # Chebyshev coefficients
-        self.p_coeffs_kernel = (
-            torch.tensor(get_monic_chebyshev_coeffs(get_opt_degree(seq_len)), device=device)
-            .view(-1, 1)
-            .repeat(1, d_model)
-        )
+        # self.p_coeffs_kernel = (
+        #     torch.tensor(get_monic_chebyshev_coeffs(get_opt_degree(seq_len)), device=device)
+        #     .view(-1, 1)
+        #     .repeat(1, d_model)
+        # )
 
         # STU projection matrices
         if use_tensordot:
@@ -683,20 +683,20 @@ class SpectralAttention(nn.Module):
         self.gate = nn.Linear(d_model, d_model, device=device, dtype=dtype)
 
         # Normalization
-        self.stu_norm1 = nn.RMSNorm(d_model)
-        self.norm = nn.RMSNorm(d_model)
+        self.stu_norm1 = nn.LayerNorm(d_model)
+        self.norm = nn.LayerNorm(d_model)
 
     def compute_stu_features(self, u: torch.Tensor) -> torch.Tensor:
         """Compute STU features"""
         B, T, d = u.shape
 
         # Convolve inputs w/ Chebyshev coefficients, per https://arxiv.org/pdf/2502.06545
-        p_coeffs_conv = -fft_conv(u, self.p_coeffs_kernel, mode="same", causal=True)
+        # p_coeffs_conv = -fft_conv(u, self.p_coeffs_kernel, mode="same", causal=True)
 
         if self.use_tensordot:
             # Project first
             u_proj = u @ self.M_inputs  # (B, L, d_in) x (d_in, r) -> (B, L, r)
-            p_coeffs_conv = p_coeffs_conv @ self.M_inputs  # (B, L, d_in) x (d_in, r) -> (B, L, r)
+            # p_coeffs_conv = p_coeffs_conv @ self.M_inputs  # (B, L, d_in) x (d_in, r) -> (B, L, r)
             phi_proj = self.stu_filters @ self.M_filters  # (L, K) x (K, r) -> (L, r)
 
             # Then, convolve: (B, L, r) ⊗ (L, r) -> (B, L, r)
@@ -704,7 +704,7 @@ class SpectralAttention(nn.Module):
 
             # Final output
             out = spectral_plus if self.use_hankel_L else spectral_plus + spectral_minus
-            out = self.out_proj_stu(out + p_coeffs_conv)
+            # out = self.out_proj_stu(out + p_coeffs_conv)
         else:
             # Convolve first to get featurized inputs: (B, L, d_in) x (L, K) -> (B, L, K, d_in)
             U_plus, U_minus = stu_conv(u, self.stu_filters, self.n, self.use_tensordot)
@@ -719,12 +719,11 @@ class SpectralAttention(nn.Module):
                 spectral_minus = U_minus.view(B, L, K * d_in) @ self.M_phi_minus.view(K * d_in, self.d_model)
 
             out = spectral_plus if self.use_hankel_L else spectral_plus + spectral_minus
-            out = out + p_coeffs_conv
+            # out = out + p_coeffs_conv
 
         out = self.stu_norm1(out)
         return out
 
-    @triton.jit
     def forward(self, x: torch.Tensor, chunk_len: int = 128) -> torch.Tensor:
         B, T, d = x.shape
 
@@ -743,7 +742,7 @@ class SpectralAttention(nn.Module):
 
         # Linear attention computation
         Z = torch.einsum("bhtp,bhtn->bhtpn", V, K)  # (B, H, T, d_head, d_head)
-        H = torch.cumsum(Z, dim=-2)  # (B, H, T, d_head, d_head)
+        H = torch.cumsum(Z, dim=2)  # (B, H, T, d_head, d_head)
         Y = torch.einsum("bhtp,bhtpn->bhtn", Q, H)  # (B, H, T, d_head)
 
         # Merge heads
@@ -787,10 +786,10 @@ class SpectralAttentionLayer(nn.Module):
         self.spectral_attention = SpectralAttention(
             seq_len, d_model, k, num_heads, use_hankel_L, use_tensordot=use_tensordot, r=r, device=device
         )
-        self.spec_attn_norm = nn.RMSNorm(d_model)
+        self.spec_attn_norm = nn.LayerNorm(d_model)
         self.mlp = MLP(d_model, 4 * d_model)
-        self.mlp_norm = nn.RMSNorm(d_model)
-        self.norm = nn.RMSNorm(d_model)
+        self.mlp_norm = nn.LayerNorm(d_model)
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -853,7 +852,6 @@ class Spectron(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer("pe", pe)
-
         self.in_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
@@ -864,7 +862,7 @@ class Spectron(nn.Module):
             ]
         )
 
-        self.norm = nn.RMSNorm(d_model)
+        self.norm = nn.LayerNorm(d_model)
         self.out_proj = nn.Linear(d_model, d_out)
         self.init_weights()
 
@@ -1090,7 +1088,7 @@ def train_model(model, loader, val_loader, attn_mask=None, max_steps: int = 1000
             loss.backward()
             optimizer.step()
 
-            total_loss = loss.item()
+            total_loss = loss.detach().item()
             loss_history.append(total_loss)
             step += 1
 
@@ -1155,7 +1153,7 @@ if __name__ == "__main__":
         num_tokens_to_copy=num_tokens_to_copy,
         target_ignore_idx=target_ignore_idx,
         selective=selective,
-        rng=np.random.default_rng(SEED+1),
+        rng=np.random.default_rng(SEED + 1),
     )
     val_loader = DataLoader(val_dataset, batch_size=args.bsz, shuffle=False)
 

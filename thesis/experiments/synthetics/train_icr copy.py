@@ -378,9 +378,12 @@ class SimpleSpectralAttention(nn.Module):
         self.n = nearest_power_of_two(seq_len * 2 - 1, round_up=True)
         self.K = k  # num_eigh
         self.r = r
+        self.eps = 1e-8
 
         # STU filters
         self.stu_filters = get_spectral_filters(seq_len, k, use_hankel_L, device, dtype)
+        if self.use_tensordot:
+            self.tensordot_proj = nn.Linear(d_model, d_model)
 
         # STU projection matrices
         if use_tensordot:
@@ -392,14 +395,18 @@ class SimpleSpectralAttention(nn.Module):
             if not use_hankel_L:
                 self.M_phi_minus = nn.Parameter(torch.empty(k, d_model, d_model, dtype=dtype, device=device))
 
+        self.qk_norm_scale = nn.Parameter(torch.ones((1, self.num_heads, 1))) / torch.sqrt(torch.tensor(float(self.head_dim)))
+        self.kv_norm_scale = nn.Parameter(torch.ones((1, 1, 1, self.head_dim, self.head_dim)))
+
         # Attention components
-        self.Q = nn.Linear(d_model, d_model, device=device, dtype=dtype)
-        self.K = nn.Linear(d_model, d_model, device=device, dtype=dtype)
-        self.V = nn.Linear(d_model, d_model, device=device, dtype=dtype)
-        self.o_proj = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.wq = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.wk = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.wv = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.wo = nn.Linear(d_model, d_model, device=device, dtype=dtype)
 
         # Gate for combining attention and spectral features
-        self.gate = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.wg = nn.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.wg_z = nn.Linear(self.head_dim ** 2, 1, device=device, dtype=dtype)
 
         # Normalization
         self.norm = nn.LayerNorm(d_model)
@@ -437,34 +444,122 @@ class SimpleSpectralAttention(nn.Module):
 
         return out
 
+    def td_convfft(self, f: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """Perform causal 1D (tensordot approx.) convolution via FFT for multi-headed inputs.
+
+        Args:
+            f: Spectral filters of shape [L, D].
+            u: Input sequences of shape [B, H, L, h].
+
+        Returns:
+            Convolved sequences of shape [B, H, L, h].
+        """
+        reshaped = lambda x: x.reshape(u.shape[2], u.shape[1], u.shape[3]).transpose(1, 0, 2)
+        tr_conv = lambda x, y: torchaudio.functional.fftconvolve(x, y)[: x.shape[0]]
+        cconv = torch.vmap(tr_conv, in_dims=(0, 0), out_dims=0)
+        hconv = lambda u1, f1: cconv(u1.permute(2, 0, 1), f1.permute(2, 0, 1)).T
+        hmap = torch.vmap(hconv, in_dims=(0, 0), out_dims=0)
+        bmap = torch.vmap(hmap, in_dims=(0, None), out_dims=0)
+        return bmap(u, reshaped(f))
+
+    def full_convfft(self, v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """Compute FFT-based convolution for multi-headed inputs.
+
+        Args:
+            v: Spectral filters of shape [L, K].
+            u: Inputs of shape [B, H, L, h].
+
+        Returns:
+            Convolution output of shape [B, H, L, K, h].
+        """
+        L = u.shape[2]
+        tr_conv = lambda filter_k, channel_h: torchaudio.functional.fftconvolve(channel_h, filter_k)[:L]
+        conv_filter_with_channels = torch.vmap(tr_conv, in_dims=(None, 1), out_dims=1)
+        conv_all_filters_channels = torch.vmap(conv_filter_with_channels, in_dims=(1, None), out_dims=1)
+        conv_one_head = lambda u1, v_filters: conv_all_filters_channels(v_filters, u1)
+        conv_heads = torch.vmap(conv_one_head, in_dims=(0, None), out_dims=0)
+        conv_batch = torch.vmap(conv_heads, in_dims=(0, None), out_dims=0)
+        return conv_batch(u, v)
+
     def forward(self, x: torch.Tensor, chunk_len: int = 128) -> torch.Tensor:
-        B, T, d = x.shape
+        # B, T, d = x.shape
+
+        # # Branch 1: Compute STU features
+        # x_tilde = self.compute_stu_features(x)
+
+        # # Branch 2: Compute multihead linear attention
+        # q = self.wq(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
+        # k = self.wk(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
+        # v = self.wv(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
+        # # k, v = F.normalize(k, dim=-1), F.normalize(v, dim=-1)
+
+        # # if self.use_tensordot:
+        # #     filters = self.tensordot_proj(self.stu_filters)
+        # #     k = self.td_convfft(filters, k)
+        # #     v = self.td_convfft(filters, v)
+        # # else:
+        # #     k = self.full_convfft(self.stu_filters, k)
+        # #     v = self.full_convfft(self.stu_filters, v)
+
+        # # Z = (
+        # #     torch.einsum("bhlkd,bhlke->bhlde", v, k)
+        # #     if not self.use_tensordot
+        # #     else torch.einsum("bhld,bhle->bhlde", v, k)
+        # # ) * self.kv_norm_scale
+
+        # # Linear attention computation in spectral basis
+        # Z = torch.einsum("bhtp,bhtn->bhtpn", v, k)  # (B, H, T, d_head, d_head)
+
+        # # gate_input_z = Z.reshape(*Z.shape[:3], -1)
+        # # gates_logits_z = self.wg_z(gate_input_z)
+        # # gates_z = F.relu(gates_logits_z) ** 2 + self.eps
+        # # gates_z = gates_z[..., None]
+
+        # # gated_Z = gates_z * Z
+
+        # H = torch.cumsum(Z, dim=2)
+
+        # Y = torch.einsum("bhtp,bhtpn->bhtn", q, H)  # (B, H, T, d_head)
+
+        # # Compute gate values
+        # gate_values = torch.sigmoid(self.wg(x))  # (B, T, d)
+        
+        # # Merge heads
+        # y_attn = Y.permute(0, 2, 1, 3).contiguous().view(B, T, d)  # (B, T, d)
+        
+        # # Combine branches using element-wise gating
+        # # -> x_tilde * (1 - gate_values) + y_attn * gate_values
+        # y_combined = x_tilde + (y_attn - x_tilde) * gate_values
+
+        # # Final projection and normalization
+        # return self.wo(y_combined)
+        B, L, D = x.shape
 
         # Branch 1: Compute STU features
         x_tilde = self.compute_stu_features(x)  # (B, T, d_model)
 
         # Branch 2: Compute multihead linear attention
-        Q = self.Q(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
-        K = self.K(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
-        V = self.V(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d_head)
+        q = self.wq(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, T, d_head)
+        k = self.wk(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, T, d_head)
+        v = self.wv(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, T, d_head)
 
         # Linear attention computation
-        Z = torch.einsum("bhtp,bhtn->bhtpn", V, K)  # (B, H, T, d_head, d_head)
+        Z = torch.einsum("bhtp,bhtn->bhtpn", v, k)  # (B, H, T, d_head, d_head)
         H = torch.cumsum(Z, dim=2)
-        Y = torch.einsum("bhtp,bhtpn->bhtn", Q, H)  # (B, H, T, d_head)
+        Y = torch.einsum("bhtp,bhtpn->bhtn", q, H)  # (B, H, T, d_head)
 
         # Merge heads
-        y_attn = Y.permute(0, 2, 1, 3).contiguous().view(B, T, d)  # (B, T, d)
+        y_attn = Y.transpose(1, 2).reshape(B, L, D)  # (B, L, D)
 
         # Compute gate values
-        gate_values = torch.sigmoid(self.gate(x))  # (B, T, d)
+        gate_values = torch.sigmoid(self.wg(x))  # (B, L, D)
 
         # Combine branches using element-wise gating
         # -> x_tilde * (1 - gate_values) + y_attn * gate_values
         y_combined = x_tilde + (y_attn - x_tilde) * gate_values
 
         # Final projection and normalization
-        return self.o_proj(y_combined)
+        return self.wo(y_combined)
 
 
 class SpectralAttention(nn.Module):

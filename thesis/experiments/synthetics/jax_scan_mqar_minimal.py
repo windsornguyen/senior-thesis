@@ -1,11 +1,14 @@
 import sys
+import os
+import math
 from functools import wraps, partial
 import inspect
-from typing import Tuple, Any, Optional, Union
-import math
+from typing import Tuple, Any, Optional
+
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
+from jax.scipy.signal import convolve
 import numpy as np
 
 import flax
@@ -27,8 +30,6 @@ class TransformerConfig:
         vocab_size: int = 1024,
         dim: int = 128,
         num_heads: int = 8,
-        num_eigh: int = 32,
-        use_tensordot: bool = True,
         num_layers: int = 2,
         dropout_rate: float = 0.0,
         max_seq_len: int = 512,
@@ -39,7 +40,7 @@ class TransformerConfig:
         # MQAR task parameters
         seq_len: int = 512,
         num_pairs: int = 4,
-        alpha: float = 0.1,
+        alpha: float = 0.01,
         # Data parameters
         train_size: int = 131072,
         val_size: int = 4096,
@@ -51,8 +52,6 @@ class TransformerConfig:
         self.vocab_size = vocab_size
         self.dim = dim
         self.num_heads = num_heads
-        self.num_eigh = num_eigh
-        self.use_tensordot = use_tensordot
         self.num_layers = num_layers
         self.dropout_rate = dropout_rate
         self.max_seq_len = max_seq_len
@@ -84,7 +83,7 @@ def generate_jax_mqar_data(
     sequence_len: int = 512,
     vocab_size: int = 8192,
     num_pairs: int = 64,
-    alpha: float = 0.1,
+    alpha: float = 2.0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jax.random.PRNGKey]:
     """
     Wrapper that uses the imported MQAR function and converts to JAX arrays.
@@ -95,7 +94,7 @@ def generate_jax_mqar_data(
     # Create dataset using imported function
     dataset = generate_mqar(
         num_examples=num_examples,
-        seq_len=sequence_len,
+        sequence_len=sequence_len,
         vocab_size=vocab_size,
         num_pairs=num_pairs,
         alpha=alpha,
@@ -118,7 +117,7 @@ def generate_jax_mqar_data(
     return inputs_jax, targets_jax, new_key
 
 
-def generate_test_cases(rng, vocab_size, num_pairs, sequence_len, num_examples=10, alpha=0.1):
+def generate_test_cases(rng, vocab_size, num_pairs, sequence_len, num_examples=10, alpha=0.01):
     """Generate test cases for evaluation."""
     # Extract seed from key
     seed = jax.random.randint(rng, (), 0, 2**31 - 1).item()
@@ -126,7 +125,7 @@ def generate_test_cases(rng, vocab_size, num_pairs, sequence_len, num_examples=1
     # Create smaller test dataset
     dataset = generate_mqar(
         num_examples=num_examples,
-        seq_len=sequence_len,
+        sequence_len=sequence_len,
         vocab_size=vocab_size,
         num_pairs=num_pairs,
         alpha=alpha,
@@ -333,44 +332,16 @@ def enforce_associativity(op=None, *, check_flag="check_associativity", sample_k
     return decorator
 
 
-def get_hankel(seq_len: int, use_hankel_L: bool = False) -> jnp.ndarray:
-    """Generate a Hankel matrix for spectral filtering.
-
-    Args:
-        seq_len: Sequence length.
-        use_hankel_L: If True, use Hankel-L variant.
-
-    Returns:
-        Hankel matrix of shape [seq_len, seq_len].
-    """
-    entries = jnp.arange(1, seq_len + 1, dtype=jnp.float32)
-    i_plus_j = entries[:, None] + entries[None, :]
-    if use_hankel_L:
-        sgn = (-1.0) ** (i_plus_j - 2.0) + 1.0
-        denom = (i_plus_j + 3.0) * (i_plus_j - 1.0) * (i_plus_j + 1.0)
-        return sgn * (8.0 / denom)
-    return 2.0 / (i_plus_j**3 - i_plus_j)
+def get_hankel_matrix(n: int) -> jnp.ndarray:
+    i = jnp.arange(1, n + 1)
+    j = jnp.arange(1, n + 1)
+    I, J = jnp.meshgrid(i, j, indexing="ij")
+    return 2 / ((I + J) ** 3 - (I + J))
 
 
-def get_spectral_filters(
-    seq_len: int, K: int, use_hankel_L: bool = False, dtype: jnp.dtype = jnp.float32
-) -> jnp.ndarray:
-    """Compute spectral filters via eigen-decomposition of Hankel matrix.
-
-    Args:
-        seq_len: Sequence length.
-        K: Number of top eigenvalues to retain.
-        use_hankel_L: If True, use Hankel-L variant.
-        dtype: Data type for the output.
-
-    Returns:
-        Spectral filters of shape [seq_len, K].
-    """
-    eig_vals, eig_vecs = jnp.linalg.eigh(get_hankel(seq_len))
-    eig_vals = eig_vals[-K:]
-    eig_vecs = eig_vecs[:, -K:]
-    eig_vecs = eig_vecs * eig_vals ** 0.25
-    return eig_vals, eig_vecs
+def get_spectral_filters(n: int, k: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    eig_vals, eig_vecs = jnp.linalg.eigh(get_hankel_matrix(n))
+    return eig_vals[-k:], eig_vecs[:, -k:]
 
 
 def compute_dimensions(n: int) -> tuple[int, int, int]:
@@ -401,7 +372,7 @@ def get_tensorized_spectral_filters(
     k = min(k, k_max)
 
     # Compute eigen-decomposition on a Hankel matrix of size sqrt_T_prime.
-    Z = get_hankel(sqrt_T_prime)
+    Z = get_hankel_matrix(sqrt_T_prime)
     sigma, phi = jnp.linalg.eigh(Z)
 
     # Select the last k eigenvectors and weight them by sigma**0.25.
@@ -415,95 +386,7 @@ def get_tensorized_spectral_filters(
     filters = jnp.kron(phi_i, phi_j)
     return filters, filters
 
-
-@jax.jit
-def conv(filters: jnp.ndarray, keys: jnp.ndarray) -> jnp.ndarray:
-    """
-    Compute convolution to project input sequences into the spectral basis.
-
-    Args:
-      filters: jnp.ndarray of shape [seq_len, num_heads]
-        Each column is the spectral filter for a head.
-      keys: jnp.ndarray of shape [batch_size, num_heads, seq_len, head_dim]
-        Input sequences for each head and feature.
-
-    Returns:
-      jnp.ndarray of shape [batch_size, num_heads, seq_len, head_dim]
-        The result of convolving each head's filter with the corresponding input sequences.
-    """
-
-    # 1. Basic 1D convolution that truncates the output to the input length.
-    def conv1d(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-        return jax.scipy.signal.convolve(x, y, method="fft")[: x.shape[0]]
-
-    # 2. Apply conv1d over the feature dimension.
-    # Given a filter (shape [seq_len]) and a key matrix (shape [seq_len, head_dim]),
-    # apply conv1d independently for each feature.
-    conv_over_features = jax.vmap(conv1d, in_axes=(None, 1), out_axes=1)
-
-    # 3. For one head: given a filter (shape [seq_len]) and keys for that head
-    # (shape [seq_len, head_dim]), convolve each feature dimension.
-    def conv_head(filter_seq: jnp.ndarray, key_seq: jnp.ndarray) -> jnp.ndarray:
-        return conv_over_features(filter_seq, key_seq)
-
-    # 4. Vectorize conv_head over the heads.
-    # filters_T will have shape [num_heads, seq_len],
-    # and for each head, we pair the filter with the corresponding key sequence (shape [seq_len, head_dim]).
-    conv_over_heads = jax.vmap(conv_head, in_axes=(0, 0), out_axes=0)
-
-    # 5. Transpose filters so that each head's filter is a row: [num_heads, seq_len].
-    filters_T = filters.T
-
-    # 6. Finally, vectorize over the batch dimension.
-    # For each element in the batch (of shape [num_heads, seq_len, head_dim]),
-    # apply conv_over_heads.
-    conv_over_batch = jax.vmap(lambda keys_batch: conv_over_heads(filters_T, keys_batch), in_axes=0, out_axes=0)
-
-    return conv_over_batch(keys)
-
-@jax.jit
-def tensordot_conv(f: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
-    """Perform a causal 1D convolution via FFT along the sequence dimension
-    for multiheaded inputs.
-
-    Args:
-        f: jnp.ndarray of shape [L, D]
-            The projected spectral filters (to be reshaped to [H, L, h]).
-        u: jnp.ndarray of shape [B, H, L, h]
-            The input sequences for each head.
-
-    Returns:
-        jnp.ndarray of shape [B, H, L, h]
-            The convolved sequences per head.
-    """
-    reshaped = lambda x: x.reshape(u.shape[2], u.shape[1], u.shape[3]).transpose(1, 0, 2)
-    tr_conv = lambda x, y: jax.scipy.signal.convolve(x, y, method="fft")[:x.shape[0]]
-    cconv = jax.vmap(tr_conv, in_axes=(0, 0), out_axes=0)
-    hconv = lambda u1, f1: cconv(jnp.moveaxis(u1, -1, 0), jnp.moveaxis(f1, -1, 0)).T
-    hmap = jax.vmap(hconv, in_axes=(0, 0), out_axes=0)
-    bmap = jax.vmap(hmap, in_axes=(0, None), out_axes=0)
-    return bmap(u, reshaped(f))
-
-@jax.jit
-def stu_conv(v: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
-    """Compute FFT-based convolution for multiheaded inputs.
-
-    Args:
-      v: [L, K] spectral filters (shared across heads).
-      u: [B, H, L, h] inputs for each head (h is per-head feature dim).
-
-    Returns:
-      [B, H, L, K, h] output of convolving each head's input with each of the K filters.
-    """
-    tr_conv = lambda x, y: jax.scipy.signal.convolve(x, y, method="fft")[: y.shape[0]]
-    mvconv = jax.vmap(tr_conv, in_axes=(1, None), out_axes=1)
-    mmconv = jax.vmap(mvconv, in_axes=(None, 1), out_axes=-1)
-    conv_one = lambda u1: mmconv(v, u1)
-    conv_heads = jax.vmap(conv_one, in_axes=0, out_axes=0)
-    conv_batch = jax.vmap(conv_heads, in_axes=0, out_axes=0)
-    return conv_batch(u)
-
-def get_precomputed_spectral_basis(seq_len: int, num_eigh: int) -> jnp.ndarray:
+def get_precomputed_spectral_basis(seq_len: int, num_heads: int) -> jnp.ndarray:
     """Precompute the spectral basis for ScanAttention.
 
     Args:
@@ -513,7 +396,7 @@ def get_precomputed_spectral_basis(seq_len: int, num_eigh: int) -> jnp.ndarray:
     Returns:
         jnp.ndarray: Precomputed spectral basis of shape [seq_len, num_heads]
     """
-    _, spectral_basis = get_spectral_filters(seq_len, num_eigh)
+    _, spectral_basis = get_spectral_filters(seq_len, num_heads)
     return jnp.array(spectral_basis)
 
 
@@ -602,113 +485,8 @@ def safe_exp(x: jnp.ndarray, beta: float = 1.0, axis: int = None) -> jnp.ndarray
     else:
         return jnp.exp(scaled_x)
 
-def normalize(input: jnp.ndarray, 
-              p: float = 2.0, 
-              axis: Union[int, Tuple[int, ...]] = 1, 
-              eps: float = 1e-12) -> jnp.ndarray:
-    norm = jnp.linalg.norm(input, ord=p, axis=axis, keepdims=True)
-    return input / jnp.maximum(norm, eps)
 
-# class ScanAttention(nn.Module):
-#     dim: int
-#     num_heads: int
-#     seq_len: int
-#     spectral_basis: jnp.ndarray
-#     eps: float = 1e-5
-
-#     def setup(self):
-#         self.head_dim = self.dim // self.num_heads
-#         self.wq = nn.Dense(self.dim)
-#         self.wk = nn.Dense(self.dim)
-#         self.wv = nn.Dense(self.dim)
-#         self.wo = nn.Dense(self.dim)
-#         # Gating projection: maps [D/H * D/H] to [1]
-#         self.gate_proj = nn.Dense(1)
-#         self.vk_norm_scale = self.param(
-#             "vk_norm_scale",
-#             lambda rng: jnp.ones((1, self.num_heads, 1, self.head_dim, self.head_dim))
-#         )
-#         # self.vk_norm_scale = self.param(
-#         #     "vk_norm_scale",
-#         #     lambda rng: nn.initializers.glorot_normal()(rng, shape=(1, self.num_heads, 1, self.head_dim, self.head_dim))
-#         # )
-
-#     def __call__(self, x, training=False):
-#         B, L, D = x.shape
-#         H, h = self.num_heads, self.head_dim
-
-#         # Compute QKV projections
-#         q = self.wq(x).reshape(B, L, H, h)
-#         k = self.wk(x).reshape(B, L, H, h)
-#         v = self.wv(x).reshape(B, L, H, h)
-
-#         # Transpose for better memory layout
-#         q = q.transpose(0, 2, 1, 3)
-#         k = k.transpose(0, 2, 1, 3)
-#         v = v.transpose(0, 2, 1, 3)
-
-#         # VK norm
-#         k = normalize(k, p=2.0, dim=-1, eps=self.eps)
-#         v = normalize(v, p=2.0, dim=-1, eps=self.eps)
-
-#         # Spectral basis
-#         k = conv(self.spectral_basis, k)
-#         v = conv(self.spectral_basis, v)
-
-#         # Compute pairwise interactions via outer product
-#         # Z: [B, H, S, D/H, D/H]
-#         Z = jnp.einsum("bhsd,bhse->bhsde", v, k)
-#         Z = Z * self.vk_norm_scale
-
-#         # Compute gates
-#         # Z: [B, H, S, D/H, D/H]
-#         gate_input = Z.reshape(*Z.shape[:3], -1)  # [B, H, S, (D/H)^2]
-#         gates_logits = self.gate_proj(gate_input)  # [B, H, S, 1]
-#         gates = jax.nn.relu(gates_logits) ** 2 + self.eps  # [B, H, S, 1]
-#         gates = gates[..., None]  # [B, H, S, 1, 1]
-
-#         # Prepare inputs for associative scan by gating Z
-#         gated_Z = gates * Z  # [B, H, S, D/H, D/H]
-
-#         # Define the associative addition operation
-#         def combine_fn(carry, next_val):
-#             sum_gated_Z, sum_gates = carry
-#             next_gated_Z, next_gates = next_val
-#             return (sum_gated_Z + next_gated_Z, sum_gates + next_gates)
-
-#         # Build a cumulative memory across the sequence dimension
-#         cumulative_gated_Z, cumulative_gates = jax.lax.associative_scan(combine_fn, (gated_Z, gates), axis=2)
-
-#         # Normalize to obtain causal attention weights.
-#         attn_weights = cumulative_gated_Z / (cumulative_gates + self.eps)
-
-#         # Compute raw output by applying the attention weights to the query.
-#         ctxt = jnp.einsum("bhsd,bhsde->bhse", q, attn_weights)
-
-#         # Normalize the raw output onto the unit sphere for stability.
-#         ctxt_normalized = normalize(ctxt, p=2.0, dim=-1, eps=self.eps)
-
-#         # Rearrange dimensions and apply the final projection.
-#         output_normalized = ctxt_normalized.transpose(0, 2, 1, 3).reshape(B, L, D)
-#         output = self.wo(output_normalized)
-
-#         return output
-
-# def online_softmax_combine_fn(x, y):
-#     """
-#     Binary operator for the online softmax scan.
-#     Each leaf is a tuple (m, s) where:
-#       - m is the maximum (in that leaf)
-#       - s is the sum of exp(offset)-values relative to m.
-#     For each pair:
-#       m_new = max(m_x, m_y)
-#       s_new = s_x * exp(m_x - m_new) + s_y * exp(m_y - m_new)
-#     """
-#     m_x, s_x = x
-#     m_y, s_y = y
-#     m_new = jnp.maximum(m_x, m_y)
-#     s_new = s_x * jnp.exp(m_x - m_new) + s_y * jnp.exp(m_y - m_new)
-#     return (m_new, s_new)
+# -- Chebyshev Polynomial Utilities --
 
 def poly_mul_x(poly):
     return [0.0] + poly
@@ -765,6 +543,122 @@ def get_monic_chebyshev_coeffs(n: int, dtype=jnp.float32):
 def get_opt_degree(seq_len: int) -> int:
     return int(math.ceil((7 / 6) * math.log2(seq_len)))
 
+def normalize(x, axis=-1, eps=1e-12):
+    l2_norm = jnp.linalg.norm(x, ord=2, axis=axis, keepdims=True)
+    return x / (l2_norm + eps)
+
+# -- Chebyshev 1D Convolution --
+
+@jax.jit
+def cheby_conv_1d(kernel, u):
+    """
+    Computes a 1D convolution using FFT with same padding.
+    Args:
+        kernel: Chebyshev kernel of shape [L_k]
+        u: Input of shape [B, L, D]
+    Returns:
+        Convolved output of shape [B, L, D]
+    """
+    # Reshape kernel to [L_k, 1]
+    kernel = kernel[:, None]
+    def single_conv(x, kern):
+        # x: [L,], kern: [L_k, 1] -> output: [L,]
+        return jax.scipy.signal.fftconvolve(x[:, None], kern, mode="same", axes=[0])[:, 0]
+    batch_conv = jax.vmap(single_conv, in_axes=(0, None), out_axes=0)
+    full_conv = jax.vmap(batch_conv, in_axes=(2, None), out_axes=2)
+    out = full_conv(u, kernel)
+    return out
+
+@jax.jit
+def cheby_conv(v, u):
+    """
+    Computes a 1D convolution with same padding using fftconvolve for multi-head inputs.
+    
+    Args:
+        v: Kernel of shape [L,] (length matches input length)
+        u: Input of shape [B, H, L, D] (batch, heads, length, channels)
+    
+    Returns:
+        Output of shape [B, H, L, D]
+    """
+    conv_1d = lambda x: jax.scipy.signal.fftconvolve(x[:, None], v[:, None], mode='same', axes=[0])[:, 0]
+    conv_batched = lambda x: jax.vmap(conv_1d, in_axes=0, out_axes=0)(x)
+    conv_full = lambda x: jax.vmap(jax.vmap(conv_batched, in_axes=2, out_axes=2), in_axes=1, out_axes=1)(x)
+    return conv_full(u)
+
+
+@jax.jit
+def stu_conv(filters: jnp.ndarray, keys: jnp.ndarray) -> jnp.ndarray:
+    """
+    Compute convolution to project input sequences into the spectral basis.
+
+    Args:
+      filters: jnp.ndarray of shape [seq_len, num_heads]
+        Each column is the spectral filter for a head.
+      keys: jnp.ndarray of shape [batch_size, num_heads, seq_len, head_dim]
+        Input sequences for each head and feature.
+
+    Returns:
+      jnp.ndarray of shape [batch_size, num_heads, seq_len, head_dim]
+        The result of convolving each head's filter with the corresponding input sequences.
+    """
+
+    # 1. Basic 1D convolution that truncates the output to the input length.
+    def conv1d(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+        return jax.scipy.signal.convolve(x, y, method="fft")[: x.shape[0]]
+
+    # 2. Apply conv1d over the feature dimension.
+    # Given a filter (shape [seq_len]) and a key matrix (shape [seq_len, head_dim]),
+    # apply conv1d independently for each feature.
+    conv_over_features = jax.vmap(conv1d, in_axes=(None, 1), out_axes=1)
+
+    # 3. For one head: given a filter (shape [seq_len]) and keys for that head
+    # (shape [seq_len, head_dim]), convolve each feature dimension.
+    def conv_head(filter_seq: jnp.ndarray, key_seq: jnp.ndarray) -> jnp.ndarray:
+        return conv_over_features(filter_seq, key_seq)
+
+    # 4. Vectorize conv_head over the heads.
+    # filters_T will have shape [num_heads, seq_len],
+    # and for each head, we pair the filter with the corresponding key sequence (shape [seq_len, head_dim]).
+    conv_over_heads = jax.vmap(conv_head, in_axes=(0, 0), out_axes=0)
+
+    # 5. Transpose filters so that each head's filter is a row: [num_heads, seq_len].
+    filters_T = filters.T
+
+    # 6. Finally, vectorize over the batch dimension.
+    # For each element in the batch (of shape [num_heads, seq_len, head_dim]),
+    # apply conv_over_heads.
+    conv_over_batch = jax.vmap(lambda keys_batch: conv_over_heads(filters_T, keys_batch), in_axes=0, out_axes=0)
+
+    return conv_over_batch(keys)
+
+@jax.jit
+def bsc(v: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
+    """Batched STU convolution.
+    
+    Compute convolution to project batched input sequences into the spectral basis.
+    
+    Args:
+        v: Top k eigenvectors of shape [L, K].
+        u: Input of shape [B, L, D] (batch, length, input channels).
+    
+    Returns:
+        A tensor of shape [B, L, K, D] (batch, length, filters, channels).
+    """
+    # Single 1D convolution with same padding
+    conv_1d = lambda x, y: jax.scipy.signal.convolve(x, y, mode='same', method='fft')
+
+    # Vectorize over filters (K)
+    conv_filters = lambda x, y: jax.vmap(conv_1d, in_axes=(None, 0), out_axes=1)(x, y)
+    
+    # Vectorize over channels (D)
+    conv_channels = lambda x, y: jax.vmap(conv_filters, in_axes=(0, None), out_axes=-1)(x, y)
+    
+    # Vectorize over batch (B)
+    conv_batch = lambda x, y: jax.vmap(conv_channels, in_axes=(0, None), out_axes=0)(x, y)
+    
+    return conv_batch(u, v)
+
 @jax.jit
 def bc(v: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
     """
@@ -782,75 +676,40 @@ def bc(v: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
     conv_full = lambda x: jax.vmap(conv_batched, in_axes=2, out_axes=2)(x)
     return conv_full(u)
 
+def check(x: jnp.ndarray) -> None:
+    jax.debug.print(f"x mean: {jnp.mean(x)}, x var: {jnp.var(x)}")
+
 @jax.jit
-def magic_conv(v, u):
+def causal_conv(filters: jnp.ndarray, inputs: jnp.ndarray) -> jnp.ndarray:
     """
-    Computes a 1D convolution with same padding using fftconvolve for multi-head inputs.
+    Performs causal 1D convolution via FFT with K filters across heads and channels.
     
     Args:
-        v: Kernel of shape [L,] (length matches input length)
-        u: Input of shape [B, H, L, D] (batch, heads, length, channels)
+        filters: [S, K]
+        inputs: [B, H, S, D/H]
     
     Returns:
-        Output of shape [B, H, L, D]
+        [B, H, S, K * D/H]
     """
-    conv_1d = lambda x: jax.scipy.signal.fftconvolve(x[:, None], v[:, None], mode='same', axes=[0])[:, 0]
-    conv_batched = lambda x: jax.vmap(conv_1d, in_axes=0, out_axes=0)(x)
-    conv_full = lambda x: jax.vmap(jax.vmap(conv_batched, in_axes=2, out_axes=2), in_axes=1, out_axes=1)(x)
-    return conv_full(u)
-
-@jax.jit
-def combine_fn(x: Tuple, y: Tuple) -> Tuple:
-    """Combine two leaves for gated causal attention with online softmax.
-
-    Args:
-        x, y: Tuples of (m, s, Z, g) where:
-            m: Score/logit for numerical stability.
-            s: Running sum of exp(score - m).
-            Z: Outer product interaction matrix.
-            g: Gate value.
-
-    Returns:
-        Combined tuple (m_new, s_new, Z_new, g_new).
-    """
-    m_x, s_x, Z_x, g_x = x
-    m_y, s_y, Z_y, g_y = y
-
-    m_new = jnp.maximum(m_x, m_y)
-    exp_x = jnp.exp(m_x - m_new)
-    exp_y = jnp.exp(m_y - m_new)
-    s_new = s_x * exp_x + s_y * exp_y
-    Z_new = Z_x + Z_y
-    g_new = g_x + g_y
-    return m_new, s_new, Z_new, g_new
-
-
-@jax.jit
-def scan_fn(qk_slice: jnp.ndarray, Z_slice: jnp.ndarray, g_slice: jnp.ndarray):
-    """Process a single (batch, head) slice for scanning.
-
-    Args:
-        qk_slice: QK similarity scores of shape [L].
-        Z_slice: Interaction matrix of shape [L, h, h].
-        g_slice: Gate values of shape [L, 1, 1].
-
-    Returns:
-        Scanned tuple (m, s, Z, g).
-    """
-    leaves = (qk_slice, jnp.ones_like(qk_slice), Z_slice, g_slice)
-    return jax.lax.associative_scan(combine_fn, leaves, axis=0)
-
-
-@jax.jit
-def batched_scan_fn(sim, gated_Z, gates):
-    return jax.vmap(jax.vmap(scan_fn, in_axes=(0, 0, 0)), in_axes=(0, 0, 0))(sim, gated_Z, gates)
+    # [S,] with [S,] -> [S,]
+    conv_1d = lambda x, f: convolve(x, f, method='fft')[:x.shape[0]]
+    # [S,] with [S, K] -> [S, K]
+    conv_filters = lambda x: jax.vmap(conv_1d, in_axes=(None, 1), out_axes=1)(x, filters)
+    # [S, D/H] -> [S, K, D/H]
+    conv_channels = lambda x: jax.vmap(conv_filters, in_axes=1, out_axes=2)(x)
+    # [H, S, D/H] -> [H, S, K, D/H]
+    conv_heads = lambda x: jax.vmap(conv_channels, in_axes=0, out_axes=0)(x)
+    # [B, H, S, D/H] -> [B, H, S, K, D/H]
+    conv_batch = lambda x: jax.vmap(conv_heads, in_axes=0, out_axes=0)(x)
+    output = conv_batch(inputs)
+    B, H, S, K, D_per_H = output.shape
+    return output.reshape(B, H, S, K * D_per_H)
 
 class ScanAttention(nn.Module):
     dim: int
     num_heads: int
     seq_len: int
-    spectral_basis: jnp.ndarray
-    use_tensordot: bool = False
+    spectral_basis: jnp.ndarray  # Assume precomputed/fixed convolution kernel for spectral basis
     eps: float = 1e-5
 
     def setup(self):
@@ -859,188 +718,79 @@ class ScanAttention(nn.Module):
         self.wk = nn.Dense(self.dim)
         self.wv = nn.Dense(self.dim)
         self.wo = nn.Dense(self.dim)
-        
-        if self.use_tensordot:
-            self.tensordot_proj = nn.Dense(self.dim)  # Project filters: [L, K] @ [K, dim]
+        self.gate_proj = nn.Dense(1)
+        self.beta = self.param("beta", lambda rng: jnp.array(1.0))
+        # Learnable scaling for baseline subtraction
+        self.alpha = self.param("alpha", lambda rng: jnp.array(1.0))
+        self.scaleup = self.param("scaleup", lambda rng: jnp.ones((1, self.num_heads, 1, self.dim, self.dim)))
 
-        # Gating projection: maps [D/H * D/H] to [1]
-        self.wg = nn.Dense(1)
-        self.kv_norm_scale = self.param(
-            "kv_norm_scale",
-            lambda rng: jnp.ones((1, self.num_heads, 1, self.head_dim, self.head_dim))
-        )
-        self.qk_norm_scale = self.param(
-            "qk_norm_scale",
-            lambda rng: jnp.full((1, self.num_heads, 1), 1/jnp.sqrt(self.head_dim))
-        )
-
-    def combine_fn(self, x, y):
-            """
-            Combines two leaves for gated causal attention with online softmax.
-            Each leaf is a tuple:
-            (m, s, n, Z, g)
-            where:
-            m: the score/logit for numerical stability
-            s: running sum of exp(score-m)
-            n: running sum of exp(score-m)*value
-            Z: the outer product interaction matrix
-            g: the gate value
-            """
-            m_x, s_x, n_x, Z_x, g_x = x
-            m_y, s_y, n_y, Z_y, g_y = y
-            
-            # Compute new maximum
-            m_new = jnp.maximum(m_x, m_y)
-            
-            # Scale factors
-            exp_x = jnp.exp(m_x - m_new)
-            exp_y = jnp.exp(m_y - m_new)
-
-            # Update softmax components
-            s_new = s_x * exp_x + s_y * exp_y
-            n_new = n_x * exp_x[..., None] + n_y * exp_y[..., None]
-
-            # Update gated Z and gate accumulation
-            Z_new = Z_x + Z_y
-            g_new = g_x + g_y
-            
-            return (m_new, s_new, n_new, Z_new, g_new)
+        self.num_terms = get_opt_degree(self.seq_len)
+        self.p_coeffs = self.param("p_coeffs", lambda rng: get_monic_chebyshev_coeffs(self.num_terms - 1))
     
-    def scan_fn(self, qk_slice, v_slice, Z_slice, g_slice):
-        """Process a single (batch, head) slice"""
-        # Set up leaf elements
-        # qk_slice: [L], v_slice: [L, h], Z_slice: [L, h, h], g_slice: [L, 1, 1]
-        leaves_m = qk_slice                  # [L]
-        leaves_s = jnp.ones_like(qk_slice)   # [L]
-        leaves_n = v_slice                   # [L, h]
-        leaves_Z = Z_slice                   # [L, h, h]
-        leaves_g = g_slice                   # [L, 1, 1]
+    def __call__(self, x, training=False):
+        batch_size, seq_len, _ = x.shape
+        K = self.spectral_basis.shape[1]  # Number of filters
 
-        leaves = (leaves_m, leaves_s, leaves_n, leaves_Z, leaves_g)
-        return jax.lax.associative_scan(self.combine_fn, leaves, axis=0)
+        # Compute QKV projections
+        q = self.wq(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.wk(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.wv(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
 
-    # def __call__(self, x, training=False):
-    #     B, L, D = x.shape
-    #     H, h = self.num_heads, self.head_dim
-        
-    #     # Compute QKV projections
-    #     q = self.wq(x).reshape(B, L, H, h)
-    #     k = self.wk(x).reshape(B, L, H, h)
-    #     v = self.wv(x).reshape(B, L, H, h)
-        
-    #     # Transpose for better memory layout
-    #     q = q.transpose(0, 2, 1, 3)  # [B, H, L, h]
-    #     k = k.transpose(0, 2, 1, 3)  # [B, H, L, h]
-    #     v = v.transpose(0, 2, 1, 3)  # [B, H, L, h]
+        # Transpose: [B, S, H, D/H] -> [B, H, S, D/H]
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
 
-    #     # [B, H, L]
-    #     sim = jnp.einsum("bhld,bhld->bhl", q, k) * self.qk_norm_scale
+        # Normalize k and v
+        k = normalize(k, axis=-1)
+        v = normalize(v, axis=-1)
 
-    #     # KV norm (QK norm analog)
-    #     k = normalize(k, p=2.0, axis=-1, eps=self.eps)
-    #     v = normalize(v, p=2.0, axis=-1, eps=self.eps)
+        # Spectral basis: [B, H, S, D/H] -> [B, H, S, K * D/H]
+        k = causal_conv(self.spectral_basis, k)
+        v = causal_conv(self.spectral_basis, v)
 
-    #     # Apply spectral basis
-    #     if self.use_tensordot:
-    #         filters = self.tensordot_proj(self.spectral_basis)  # [L, K] @ [K, D] -> [L, D]
-    #         k = tensordot_conv(filters, k)
-    #         v = tensordot_conv(filters, v)
-    #     else:
-    #         k = stu_conv(self.spectral_basis, k)
-    #         v = stu_conv(self.spectral_basis, v)
+        # Project q to match: [B, H, S, D/H] -> [B, H, S, K * D/H]
+        # Here, we assume wq can be adjusted to output K * head_dim per head, or add a separate projection
+        # For simplicity, assume q is already compatible (in practice, adjust wq or add a layer)
+        # If not, you'd need: q = some_projection(q) to [B, H, S, K * D/H]
 
-    #     # Compute pairwise interactions via outer product
-    #     if self.use_tensordot:
-    #         Z = jnp.einsum("bhld,bhle->bhlde", v, k)
-    #     else:
-    #         Z = jnp.einsum("bhlkd,bhlke->bhlde", v, k)
-    #     Z = Z * self.kv_norm_scale
+        # Outer product: [B, H, S, K * D/H] x [B, H, S, K * D/H] -> [B, H, S, K * D/H, K * D/H]
+        Z = jnp.einsum("bhsd,bhse->bhsde", v, k) * self.scaleup
 
-    #     # Compute gates
-    #     gate_input = Z.reshape(*Z.shape[:3], -1)  # [B, H, L, h²]
-    #     gates_logits = self.gate_proj(gate_input)  # [B, H, L, 1]
-    #     gates = jax.nn.relu(gates_logits) ** 2 + self.eps  # [B, H, L, 1]
-    #     gates = gates[..., None]  # [B, H, L, 1, 1]
+        # Gates: [B, H, S, (K * D/H)^2] -> [B, H, S, 1] -> [B, H, S, 1, 1]
+        gate_input = Z.reshape(*Z.shape[:3], -1)
+        gates_logits = self.gate_proj(gate_input)
+        gates = jax.nn.relu(gates_logits) ** 2 + self.eps
+        gates = gates[..., None]
 
-    #     # Apply gating to Z
-    #     gated_Z = gates * Z  # [B, H, L, h, h]
+        # Gated Z: [B, H, S, K * D/H, K * D/H]
+        gated_Z = gates * Z
 
-    #     # Vmap over the head dimension (for a single batch)
-    #     batch_scan_fn = jax.vmap(self.scan_fn, in_axes=(0, 0, 0, 0))
+        # Associative scan
+        def combine_fn(carry, next_val):
+            sum_gated_Z, sum_gates = carry
+            next_gated_Z, next_gates = next_val
+            return (sum_gated_Z + next_gated_Z, sum_gates + next_gates)
 
-    #     # Vmap over the batch dimension
-    #     batched_scan_fn = jax.vmap(batch_scan_fn, in_axes=(0, 0, 0, 0))
+        cumulative_gated_Z, cumulative_gates = jax.lax.associative_scan(
+            combine_fn, (gated_Z, gates), axis=2
+        )
 
-    #     # Run the scan over all dimensions at once
-    #     m_scan, s_scan, n_scan, Z_scan, g_scan = batched_scan_fn(sim, v, gated_Z, gates)
+        # Attention weights: [B, H, S, K * D/H, K * D/H]
+        attn_weights = cumulative_gated_Z / (cumulative_gates + self.eps)
 
-    #     # --- Compute the final attention outputs ---
+        # Output: [B, H, S, K * D/H] x [B, H, S, K * D/H, K * D/H] -> [B, H, S, D/H]
+        # Adjust q to match or reduce attn_weights; here, assume q needs projection
+        # For now, add a reduction step (e.g., sum over one K * D/H dim)
+        attn_weights_reduced = attn_weights.sum(axis=3)  # [B, H, S, K * D/H]
+        output_raw = jnp.einsum("bhsd,bhse->bhse", q, attn_weights_reduced)
 
-    #     # 1. Compute the normalized online softmax weights
-    #     # [B, H, L, 1, 1]
-    #     softmax_weights = jnp.exp(sim - m_scan)[..., None, None] \
-    #                     / (s_scan[..., None, None] + self.eps)
+        # Normalize and reshape
+        output_norm = normalize(output_raw, axis=-1)
+        output_normalized = output_norm.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.dim)
+        return self.wo(output_normalized)
 
-    #     # 2. Gated accumulation normalization
-    #     gated_weights = Z_scan / (g_scan + self.eps)
 
-    #     # Multiplicatively modulate the gated weights with the softmax weights
-    #     attn_weights = gated_weights * (1.0 + jax.nn.silu(softmax_weights))
-
-    #     # Query from the attention weights
-    #     ctxt = jnp.einsum("bhld,bhlde->bhle", q, attn_weights)  # [B, H, L, h]
-
-    #     # Reshape and project
-    #     ctxt_norm = normalize(ctxt, axis=-1)
-    #     output = ctxt_norm.transpose(0, 2, 1, 3).reshape(B, L, D)
-    #     output = self.wo(output)
-
-    #     return output
-    def __call__(self, x: jnp.ndarray, training: bool = False) -> jnp.ndarray:
-        B, L, D = x.shape
-        H, h = self.num_heads, self.head_dim
-
-        q = self.wq(x).reshape(B, L, H, h).transpose(0, 2, 1, 3)  # [B, H, L, h]
-        k = self.wk(x).reshape(B, L, H, h).transpose(0, 2, 1, 3)  # [B, H, L, h]
-        v = self.wv(x).reshape(B, L, H, h).transpose(0, 2, 1, 3)  # [B, H, L, h]
-
-        sim = jnp.einsum("bhld,bhld->bhl", q, k) * self.qk_norm_scale  # [B, H, L]
-        k = normalize(k, p=2.0, axis=-1, eps=self.eps)
-        v = normalize(v, p=2.0, axis=-1, eps=self.eps)
-
-        if self.use_tensordot:
-            filters = self.tensordot_proj(self.spectral_basis)
-            k = tensordot_conv(filters, k)
-            v = tensordot_conv(filters, v)
-        else:
-            k = stu_conv(self.spectral_basis, k)
-            v = stu_conv(self.spectral_basis, v)
-
-        Z = jnp.einsum("bhlkd,bhlke->bhlde", v, k) if not self.use_tensordot else jnp.einsum("bhld,bhle->bhlde", v, k)
-        Z = Z * self.kv_norm_scale
-
-        gate_input = Z.reshape(*Z.shape[:3], -1)  # [B, H, L, h²]
-        gates_logits = self.wg(gate_input)  # [B, H, L, 1]
-        gates = nn.relu(gates_logits) ** 2 + self.eps  # [B, H, L, 1]
-        gates = gates[..., None]  # [B, H, L, 1, 1]
-
-        gated_Z = gates * Z  # [B, H, L, h, h]
-
-        m_scan, s_scan, Z_scan, g_scan = batched_scan_fn(sim, gated_Z, gates)
-
-        softmax_weights = jnp.exp(sim - m_scan)[..., None, None] / (s_scan[..., None, None] + self.eps)
-        gated_weights = Z_scan / (g_scan + self.eps)
-        attn_weights = gated_weights * (1.0 + nn.silu(softmax_weights))
-
-        # Query from the attention weights
-        ctxt = jnp.einsum("bhld,bhlde->bhle", q, attn_weights)  # [B, H, L, h]
-
-        # Reshape and project
-        ctxt_norm = normalize(ctxt, axis=-1)
-        output = ctxt_norm.transpose(0, 2, 1, 3).reshape(B, L, D)
-        output = self.wo(output)
-
-        return output
 
 # ------------------------------------------------------------------------
 # Transformer Layers and Model
@@ -1097,7 +847,6 @@ class Transformer(nn.Module):
 
     config: TransformerConfig
     spectral_basis: Optional[jnp.ndarray] = None
-    use_tensordot: bool = False
 
     def setup(self):
         # Select attention class based on config
@@ -1107,7 +856,7 @@ class Transformer(nn.Module):
             if self.spectral_basis is None:
                 raise ValueError("spectral_basis must be provided for scan attention")
             attention_class = lambda *args, **kwargs: ScanAttention(
-                *args, **kwargs, spectral_basis=self.spectral_basis, use_tensordot=self.use_tensordot,
+                *args, **kwargs, spectral_basis=self.spectral_basis
             )
         else:
             raise ValueError(f"Unknown attention type: {self.config.attention_type}")
@@ -1336,9 +1085,9 @@ def train_model(config, model, train_inputs, train_targets, val_inputs=None, val
                 pbar.set_postfix(
                     {
                         "train_loss": f"{metrics['loss']:.4f}",
-                        "train_acc": f"{metrics['accuracy'] * 100:.2f}%",
+                        "train_acc": f"{metrics['accuracy']*100:.2f}%",
                         "val_loss": f"{val_loss:.4f}",
-                        "val_acc": f"{val_acc * 100:.2f}%",
+                        "val_acc": f"{val_acc*100:.2f}%",
                     }
                 )
 
@@ -1357,9 +1106,9 @@ def train_model(config, model, train_inputs, train_targets, val_inputs=None, val
                     pbar.set_postfix(
                         {
                             "train_loss": f"{train_batch_metrics[-1]['loss']:.4f}",
-                            "train_acc": f"{train_batch_metrics[-1]['accuracy'] * 100:.2f}%",
+                            "train_acc": f"{train_batch_metrics[-1]['accuracy']*100:.2f}%",
                             "val_loss": f"{val_loss:.4f}",
-                            "val_acc": f"{val_acc * 100:.2f}%",
+                            "val_acc": f"{val_acc*100:.2f}%",
                         }
                     )
 
@@ -1373,11 +1122,11 @@ def train_model(config, model, train_inputs, train_targets, val_inputs=None, val
 
             # Print epoch summary
             print(
-                f"\nEpoch {epoch + 1}/{config.num_epochs} | "
+                f"\nEpoch {epoch+1}/{config.num_epochs} | "
                 f"Train Loss: {train_loss:.4f} | "
-                f"Train Acc: {train_acc * 100:.2f}% | "
+                f"Train Acc: {train_acc*100:.2f}% | "
                 f"Val Loss: {val_loss:.4f} | "
-                f"Val Acc: {val_acc * 100:.2f}%"
+                f"Val Acc: {val_acc*100:.2f}%"
             )
 
     return state, train_metrics, val_metrics
@@ -1585,10 +1334,8 @@ def run_experiment(config_override=None):
     """Run the Multi-Query Associative Recall experiment with both vanilla and scan attention."""
     # Default configuration
     base_config = TransformerConfig(
-        dim=128,
-        num_heads=2,
-        num_eigh=32,
-        use_tensordot=True,
+        dim=64,
+        num_heads=16,
         num_layers=2,
         dropout_rate=0.0,
         max_seq_len=256,
@@ -1599,7 +1346,7 @@ def run_experiment(config_override=None):
         # MQAR-specific parameters
         seq_len=256,  # Sequence length for MQAR
         num_pairs=32,  # Number of key-value pairs
-        alpha=0.1,
+        alpha=0.01,
         train_size=100000,
         val_size=3000,
         batch_size=64,
@@ -1628,43 +1375,38 @@ def run_experiment(config_override=None):
     print("Generating training data...")
     rng, data_rng = jax.random.split(rng)
     train_inputs, train_targets, rng = generate_jax_mqar_data(
-        data_rng,
-        base_config.train_size,
-        base_config.seq_len,
-        base_config.vocab_size,
-        base_config.num_pairs,
-        base_config.alpha,
+        data_rng, base_config.train_size, base_config.seq_len, base_config.vocab_size, base_config.num_pairs
     )
 
     print("Generating validation data...")
     rng, data_rng = jax.random.split(rng)
     val_inputs, val_targets, rng = generate_jax_mqar_data(
-        data_rng,
-        base_config.val_size,
-        base_config.seq_len,
-        base_config.vocab_size,
-        base_config.num_pairs,
-        base_config.alpha,
+        data_rng, base_config.val_size, base_config.seq_len, base_config.vocab_size, base_config.num_pairs
     )
 
-    print("Training with the following configurations")
-    for key, value in scan_config.__dict__.items():
-        print(f"{key}: {value}")
-    print("\n")
+    # Generate test cases for evaluation
+    print("Generating test cases...")
+    rng, test_rng = jax.random.split(rng)
+    test_cases = generate_test_cases(
+        test_rng,
+        base_config.vocab_size,
+        base_config.num_pairs,
+        base_config.seq_len,
+        base_config.val_size,
+        base_config.alpha,
+    )
 
     # Train Scan Attention model
     print("\nTraining with Scan Attention...")
     # Add spectral basis computation here
-    # spectral_basis = get_precomputed_spectral_basis(scan_config.seq_len, scan_config.num_heads)
-    spectral_basis = get_precomputed_spectral_basis(scan_config.seq_len, scan_config.num_eigh)
-    use_tensordot=scan_config.use_tensordot
-    scan_model = Transformer(scan_config, spectral_basis=spectral_basis, use_tensordot=use_tensordot)  # Pass spectral_basis here
-    # print("\nScan Attention Model:")
-    # print(f"- Parameters: ~{scan_model.count_params() / 1e6:.2f}M")
+    spectral_basis = get_precomputed_spectral_basis(scan_config.seq_len, scan_config.num_heads)
+    scan_model = Transformer(scan_config, spectral_basis=spectral_basis)  # Pass spectral_basis here
+    print(f"\nScan Attention Model:")
+    print(f"- Parameters: ~{scan_model.count_params() / 1e6:.2f}M")
 
-    # scan_state, scan_train_metrics, scan_val_metrics = train_model(
-    #     scan_config, scan_model, train_inputs, train_targets, val_inputs, val_targets
-    # )
+    scan_state, scan_train_metrics, scan_val_metrics = train_model(
+        scan_config, scan_model, train_inputs, train_targets, val_inputs, val_targets
+    )
 
     # Evaluate scan model
     # print("\nEvaluating Scan Attention model...")
@@ -1675,7 +1417,7 @@ def run_experiment(config_override=None):
     # Train Vanilla Attention model
     print("\nTraining with Vanilla Attention...")
     vanilla_model = Transformer(vanilla_config)
-    print("\nVanilla Attention Model:")
+    print(f"\nVanilla Attention Model:")
     print(f"- Parameters: ~{vanilla_model.count_params() / 1e6:.2f}M")
 
     vanilla_state, vanilla_train_metrics, vanilla_val_metrics = train_model(
@@ -1720,8 +1462,13 @@ def run_experiment(config_override=None):
 
 
 if __name__ == "__main__":
+    # Print system information
     print(f"Python version: {sys.version}")
     print(f"JAX version: {jax.__version__}")
     print(f"Flax version: {flax.__version__}")
     print(f"Optax version: {optax.__version__}")
+
+    # Run experiment for both models and get results
     results = run_experiment()
+
+    # Results are already plotted inside run_experiment

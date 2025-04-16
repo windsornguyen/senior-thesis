@@ -1,4 +1,4 @@
-model_type: Spectron
+bmodel_type: Spectron
 
 # Core model dimensions
 dim: 64  # Base model dimension

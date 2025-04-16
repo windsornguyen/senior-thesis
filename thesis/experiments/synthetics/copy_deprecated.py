@@ -464,11 +464,11 @@ if __name__ == "__main__":
         seed=seed + 1,  # different seed for validation
         dtype=dtype,
     )
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
 
     # TransformerCopyModel
     trans_copy_model = TransformerCopyModel(
-        seq_len=input_seq_len, d_model=64, vocab_size=vocab_size, num_layers=2, num_heads=8, dropout=0.0
+        seq_len=input_seq_len, d_model=128, vocab_size=vocab_size, num_layers=2, num_heads=2, dropout=0.0
     ).to(device)
     compiled_trans_model = torch.compile(trans_copy_model, fullgraph=True)
     print("\nTraining TransformerCopyModel...")
@@ -480,7 +480,7 @@ if __name__ == "__main__":
     print("\nTraining Spectron...")
     spectron = Spectron(
         seq_len=input_seq_len,
-        d_model=64,
+        d_model=128,
         k=16,
         vocab_size=vocab_size,
         d_out=(vocab_size + 4),
