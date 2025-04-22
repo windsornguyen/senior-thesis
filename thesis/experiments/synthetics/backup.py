@@ -218,7 +218,7 @@ def main():
 
     # Choose the task to run (example: in_context_recall)
     # You can switch this easily
-    task_name_to_run = "in_context_recall"
+    task_name_to_run = "selective_copying"
     task_specific_params = {}
     if task_name_to_run == "in_context_recall":
         task_specific_params = {"multi_query": False}

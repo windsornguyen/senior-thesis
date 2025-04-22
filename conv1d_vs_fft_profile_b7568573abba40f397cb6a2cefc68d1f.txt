@@ -1,0 +1,272 @@
+Conv1d vs FFT Convolution Profiling Results
+==================================================
+Method: Conv1d
+Batch: 1, Channels: 128, Seq_Len: 256, Kernel_Size: 16
+Time: 5.24 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 1, Channels: 128, Seq_Len: 256, Kernel_Size: 16
+Time: 13.73 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 1, Channels: 128, Seq_Len: 1024, Kernel_Size: 16
+Time: 5.46 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 1, Channels: 128, Seq_Len: 1024, Kernel_Size: 16
+Time: 16.57 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 1, Channels: 128, Seq_Len: 4096, Kernel_Size: 16
+Time: 10.81 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 1, Channels: 128, Seq_Len: 4096, Kernel_Size: 16
+Time: 24.71 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 1, Channels: 128, Seq_Len: 16384, Kernel_Size: 16
+Time: 33.12 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 1, Channels: 128, Seq_Len: 16384, Kernel_Size: 16
+Time: 50.46 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 1, Channels: 128, Seq_Len: 32768, Kernel_Size: 16
+Time: 62.73 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 1, Channels: 128, Seq_Len: 32768, Kernel_Size: 16
+Time: 95.85 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 1, Channels: 128, Seq_Len: 65536, Kernel_Size: 16
+Time: 129.53 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 1, Channels: 128, Seq_Len: 65536, Kernel_Size: 16
+Time: 204.30 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 1, Channels: 128, Seq_Len: 131072, Kernel_Size: 16
+Time: 257.30 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 1, Channels: 128, Seq_Len: 131072, Kernel_Size: 16
+Time: 641.56 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 1, Channels: 128, Seq_Len: 262144, Kernel_Size: 16
+Time: 510.43 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 1, Channels: 128, Seq_Len: 262144, Kernel_Size: 16
+Time: 1257.78 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 1, Channels: 128, Seq_Len: 524288, Kernel_Size: 16
+Time: 878.68 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 1, Channels: 128, Seq_Len: 524288, Kernel_Size: 16
+Time: 2502.74 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 2, Channels: 128, Seq_Len: 256, Kernel_Size: 16
+Time: 3.67 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 2, Channels: 128, Seq_Len: 256, Kernel_Size: 16
+Time: 18.68 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 2, Channels: 128, Seq_Len: 1024, Kernel_Size: 16
+Time: 5.38 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 2, Channels: 128, Seq_Len: 1024, Kernel_Size: 16
+Time: 24.69 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 2, Channels: 128, Seq_Len: 4096, Kernel_Size: 16
+Time: 15.64 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 2, Channels: 128, Seq_Len: 4096, Kernel_Size: 16
+Time: 34.04 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 2, Channels: 128, Seq_Len: 16384, Kernel_Size: 16
+Time: 55.57 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 2, Channels: 128, Seq_Len: 16384, Kernel_Size: 16
+Time: 88.50 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 2, Channels: 128, Seq_Len: 32768, Kernel_Size: 16
+Time: 113.39 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 2, Channels: 128, Seq_Len: 32768, Kernel_Size: 16
+Time: 192.93 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 2, Channels: 128, Seq_Len: 65536, Kernel_Size: 16
+Time: 223.01 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 2, Channels: 128, Seq_Len: 65536, Kernel_Size: 16
+Time: 422.26 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 2, Channels: 128, Seq_Len: 131072, Kernel_Size: 16
+Time: 441.45 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 2, Channels: 128, Seq_Len: 131072, Kernel_Size: 16
+Time: 1113.15 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 2, Channels: 128, Seq_Len: 262144, Kernel_Size: 16
+Time: 878.92 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 2, Channels: 128, Seq_Len: 262144, Kernel_Size: 16
+Time: 2197.94 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 2, Channels: 128, Seq_Len: 524288, Kernel_Size: 16
+Time: 1752.64 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 2, Channels: 128, Seq_Len: 524288, Kernel_Size: 16
+Time: 4291.22 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 4, Channels: 128, Seq_Len: 256, Kernel_Size: 16
+Time: 3.77 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 4, Channels: 128, Seq_Len: 256, Kernel_Size: 16
+Time: 19.34 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 4, Channels: 128, Seq_Len: 1024, Kernel_Size: 16
+Time: 8.77 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 4, Channels: 128, Seq_Len: 1024, Kernel_Size: 16
+Time: 24.10 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 4, Channels: 128, Seq_Len: 4096, Kernel_Size: 16
+Time: 29.19 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 4, Channels: 128, Seq_Len: 4096, Kernel_Size: 16
+Time: 45.07 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 4, Channels: 128, Seq_Len: 16384, Kernel_Size: 16
+Time: 112.83 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 4, Channels: 128, Seq_Len: 16384, Kernel_Size: 16
+Time: 155.70 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 4, Channels: 128, Seq_Len: 32768, Kernel_Size: 16
+Time: 222.91 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 4, Channels: 128, Seq_Len: 32768, Kernel_Size: 16
+Time: 365.61 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 4, Channels: 128, Seq_Len: 65536, Kernel_Size: 16
+Time: 441.48 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 4, Channels: 128, Seq_Len: 65536, Kernel_Size: 16
+Time: 762.70 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 4, Channels: 128, Seq_Len: 131072, Kernel_Size: 16
+Time: 880.41 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 4, Channels: 128, Seq_Len: 131072, Kernel_Size: 16
+Time: 2008.89 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 4, Channels: 128, Seq_Len: 262144, Kernel_Size: 16
+Time: 1754.67 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 4, Channels: 128, Seq_Len: 262144, Kernel_Size: 16
+Time: 4004.92 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: Conv1d
+Batch: 4, Channels: 128, Seq_Len: 524288, Kernel_Size: 16
+Time: 3500.98 us
+Memory: 0.00 MB
+--------------------------------------------------
+Method: FFT_Conv1d
+Batch: 4, Channels: 128, Seq_Len: 524288, Kernel_Size: 16
+Time: 7853.32 us
+Memory: 0.00 MB
+--------------------------------------------------

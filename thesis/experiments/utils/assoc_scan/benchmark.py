@@ -1,296 +1,352 @@
 import time
-
 import torch
 import jax
 import jax.numpy as jnp
-
-from kernel import associative_scan as triton_associative_scan
+from jax import jit
+from functools import partial
+import numpy as np
+import uuid
+from datetime import datetime
+from kernel_1d import associative_scan as triton_associative_scan
+from kernel import associative_scan as assoc_scan_official
 
 torch.set_float32_matmul_precision("high")
 
 
-def torch_associative_scan_reference(gated_Z, gates):
-    batch_size, feature_size, seq_len = gated_Z.shape
-    cumulative_gated_Z = torch.zeros_like(gated_Z)
-    cumulative_gates = torch.zeros_like(gates)
-    for t in range(seq_len):
-        if t == 0:
-            cumulative_gated_Z[:, :, t] = gated_Z[:, :, t]
-            cumulative_gates[:, :, t] = gates[:, :, t]
-        else:
-            cumulative_gated_Z[:, :, t] = cumulative_gated_Z[:, :, t - 1] + gated_Z[:, :, t]
-            cumulative_gates[:, :, t] = cumulative_gates[:, :, t - 1] + gates[:, :, t]
-    return cumulative_gated_Z, cumulative_gates
+def torch_associative_scan_reference(gated_Z: torch.Tensor, gates: torch.Tensor) -> tuple:
+    """PyTorch reference implementation of associative scan.
 
+    Args:
+        gated_Z: Tensor [B, D, L] of gated values.
+        gates: Tensor [B, D, L] of gating coefficients.
 
-# JAX jitted implementation using associative_scan
-@jax.jit
-def jax_scan_fn(gated_Z, gates):
-    """
-    JAX implementation using jax.lax.associative_scan to be JIT compiled once
+    Returns:
+        Tuple of cumulative gated_Z and gates, each [B, D, L].
     """
 
-    def combine_fn(a, b):
-        a_Z, a_gates = a
-        b_Z, b_gates = b
-        return (a_Z + b_Z, a_gates + b_gates)
+    def combine_fn(carry, next_val):
+        carry_gated_Z, carry_gates = carry
+        next_gated_Z, next_gates = next_val
+        return carry_gated_Z + next_gated_Z, carry_gates + next_gates
 
-    return jax.lax.associative_scan(combine_fn, (gated_Z, gates), axis=2)
+    return assoc_scan_official(
+        combine_fn=combine_fn, xs=(gated_Z, gates), dim=-1, reverse=False, combine_mode="generic"
+    )
+
+
+def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, fast_flush=True, return_mem=False):
+    """Benchmark function execution time and memory usage.
+
+    Args:
+        fn: Function to benchmark.
+        warmup: Number of warmup iterations.
+        rep: Number of benchmarking iterations.
+        grad_to_none: List of tensors to reset gradients.
+        quantiles: Quantiles for time statistics.
+        fast_flush: Whether to flush cache before benchmarking.
+        return_mem: Whether to return memory usage.
+
+    Returns:
+        Median time (ms) or (median time, median memory in MB) if return_mem is True.
+    """
+    quantiles = quantiles or [0.5]
+    device = torch.device("cuda")
+
+    try:
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        # Warmup
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+
+        # Cache flush
+        if fast_flush:
+            torch.empty(int(256e6) // 4, dtype=torch.float32, device=device).normal_()
+            torch.cuda.synchronize()
+
+        # Benchmark
+        times, mem_usages = [], []
+        for _ in range(rep):
+            if grad_to_none:
+                for x in grad_to_none:
+                    x.grad = None
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            start_event.record()
+            fn()
+            end_event.record()
+            torch.cuda.synchronize()
+            times.append(start_event.elapsed_time(end_event))
+            mem_usages.append(torch.cuda.max_memory_allocated() / (1024 * 1024))
+
+        times = torch.tensor(times, dtype=torch.float32)
+        ret = torch.quantile(times, torch.tensor(quantiles, dtype=torch.float32)).tolist()
+        median_time = ret[0]
+        median_mem = np.median(mem_usages)
+
+        return (median_time, median_mem) if return_mem else median_time
+    except Exception as e:
+        print(f"Benchmarking failed: {e}")
+        return (float("nan"), float("nan")) if return_mem else float("nan")
+
+
+@jit
+def combine_fn(a, b):
+    a_Z, a_gates = a
+    b_Z, b_gates = b
+    return a_Z + b_Z, a_gates + b_gates
+
+
+@partial(jit, static_argnums=(2,))
+def jax_scan_fn(gated_Z, gates, axis=2):
+    return jax.lax.associative_scan(combine_fn, (gated_Z, gates), axis=axis)
+
+
+def jax_bench(fn, rep=100, warmup=25):
+    """Benchmark JAX function with CUDA events.
+
+    Args:
+        fn: JAX function to benchmark.
+        rep: Number of benchmarking iterations.
+        warmup: Number of warmup iterations.
+
+    Returns:
+        Median execution time (ms).
+    """
+    try:
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        # Warmup
+        for _ in range(warmup):
+            jax.block_until_ready(fn())
+        torch.cuda.synchronize()
+
+        # Benchmark
+        times = []
+        for _ in range(rep):
+            torch.cuda.synchronize()
+            start_event.record()
+            jax.block_until_ready(fn())
+            end_event.record()
+            torch.cuda.synchronize()
+            times.append(start_event.elapsed_time(end_event))
+
+        return np.median(times)
+    except Exception as e:
+        print(f"JAX benchmarking failed: {e}")
+        return float("nan")
 
 
 def benchmark_scan_implementations(
-    configs=None, dtypes=[torch.float32, torch.bfloat16], num_warmup=5, num_trials=20, sleep_time=0.1
+    configs=None, dtypes=[torch.float32, torch.bfloat16], num_warmup=25, num_trials=100, sleep_time=0.1
 ):
-    """
-    Benchmark the Triton scan implementation against both JAX and PyTorch reference.
+    """Benchmark associative scan implementations across frameworks.
 
     Args:
-        configs: List of (batch_size, feature_size, seq_len) tuples to benchmark
-        dtypes: List of torch dtypes to benchmark
-        num_warmup: Number of warmup iterations before timing
-        num_trials: Number of trials to run for each configuration
-        sleep_time: Time to sleep between different test cases to reset thermal state
+        configs: List of (batch, features, sequence length) tuples.
+        dtypes: Data types to test.
+        num_warmup: Warmup iterations.
+        num_trials: Benchmarking iterations.
+        sleep_time: Sleep time between runs.
     """
-    if configs is None:
-        configs = [
-            # (batch_size, feature_size, seq_len)
-            (16, 8, 32),  # Small
-            (32, 16, 64),  # Medium
-            (64, 32, 128),  # Large
-            (128, 64, 256),  # Very large
-            (256, 32, 512),  # Extreme
-            (64, 64, 1024),  # Long sequence
-        ]
-
+    configs = configs or [
+        (16, 8, 32),
+        (32, 16, 64),
+        (64, 32, 128),
+        (128, 64, 256),
+        (256, 32, 512),
+        (64, 64, 1024),
+        (16, 32, 8192),
+    ]
     device = torch.device("cuda")
-    print(f"Running benchmarks on device: {torch.cuda.get_device_name()}")
-    print(f"CUDA Version: {torch.version.cuda}")
+    jax_device = jax.devices("gpu")[0] if jax.devices("gpu") else None
+
+    print(f"\nBenchmarking on {torch.cuda.get_device_name()} (CUDA {torch.version.cuda})")
+    print(f"JAX Device: {jax_device or 'default'}")
 
     for dtype in dtypes:
         jax_dtype = jnp.float32 if dtype == torch.float32 else jnp.bfloat16
-
-        print(f"\nBenchmarking with {dtype}:")
-        print(
-            f"{'Size (B,F,S)':<20} {'Triton (ms)':<15} {'JAX (ms)':<15} {'PyTorch (ms)':<15} {'Triton/JAX':<10} {'Triton/PyTorch':<10}"
+        print(f"\nBenchmarking {dtype}:")
+        header = (
+            f"{'Shape (B,F,S)':<18} | {'Triton Fwd':^12} {'Triton F+B':^12} {'Triton x':^10} | "
+            f"{'JAX Fwd':^12} {'JAX F+B':^12} {'JAX x':^10} | "
+            f"{'PyTorch Fwd':^12} {'PyTorch F+B':^12} {'PyTorch x':^10}"
         )
-        print("-" * 90)
+        print(header)
+        print("-" * len(header))
 
         for B, F, S in configs:
-            # Clear any lingering caches/memory before starting new test case
             torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-            if hasattr(jax, "clear_caches"):
-                jax.clear_caches()  # Only once before the test case, not in the loop
+            jax.clear_caches()
 
-            # Create fixed random inputs for all implementations
-            torch.manual_seed(42)  # For reproducibility
-            torch_gated_Z = torch.rand(B, F, S, device=device, dtype=dtype)
-            torch_gates = torch.rand(B, F, S, device=device, dtype=dtype)
+            # Initialize inputs
+            torch.manual_seed(42)
+            torch_gated_Z = torch.rand(B, F, S, device=device, dtype=dtype, requires_grad=True)
+            torch_gates = torch.rand(B, F, S, device=device, dtype=dtype, requires_grad=True)
 
-            # Create fixed inputs for JAX - outside the timing loop
-            jax_key = jax.random.PRNGKey(42)  # Use same seed as PyTorch
-            jax_gated_Z = jax.device_put(jax.random.uniform(jax_key, (B, F, S), dtype=jax_dtype))
+            jax_key = jax.random.PRNGKey(42)
+            jax_gated_Z = jax.device_put(jax.random.uniform(jax_key, (B, F, S), dtype=jax_dtype), device=jax_device)
             jax_key, subkey = jax.random.split(jax_key)
-            jax_gates = jax.device_put(jax.random.uniform(subkey, (B, F, S), dtype=jax_dtype))
+            jax_gates = jax.device_put(jax.random.uniform(subkey, (B, F, S), dtype=jax_dtype), device=jax_device)
 
-            # Warmup all implementations before timing
-            print(f"Warming up implementations for ({B},{F},{S})...")
+            # Triton benchmarks
+            triton_fwd_fn = lambda: triton_associative_scan(torch_gated_Z, torch_gates)
+            triton_fwd_time = do_bench(triton_fwd_fn, warmup=num_warmup, rep=num_trials, fast_flush=False)
 
-            # Warmup Triton
-            for _ in range(num_warmup):
-                _ = triton_associative_scan(torch_gated_Z, torch_gates)
-            torch.cuda.synchronize()
+            def triton_fwd_bwd_fn():
+                out_z, out_g = triton_associative_scan(torch_gated_Z, torch_gates)
+                loss = (out_z.sum() + out_g.sum()) * 1.0
+                loss.backward()
 
-            # Warmup PyTorch
-            for _ in range(num_warmup):
-                _ = torch_associative_scan_reference(torch_gated_Z, torch_gates)
-            torch.cuda.synchronize()
-
-            # Warmup JAX - compile once
-            _ = jax_scan_fn(jax_gated_Z, jax_gates)
-            jax.block_until_ready(_)  # Ensure compilation is done
-            for _ in range(num_warmup):
-                _ = jax_scan_fn(jax_gated_Z, jax_gates)
-                jax.block_until_ready(_)
-
-            # Sleep once after warmup to let thermal state settle
-            time.sleep(sleep_time)
-
-            # Arrays to store timing results
-            triton_times = []
-            jax_times = []
-            pytorch_times = []
-
-            # Benchmark all implementations with standardized timing method
-            print(f"Running timed trials for ({B},{F},{S})...")
-
-            # Benchmark Triton
-            for _ in range(num_trials):
-                torch.cuda.synchronize()  # Ensure GPU is idle
-                start_time = time.time()
-                triton_result = triton_associative_scan(torch_gated_Z, torch_gates)
-                torch.cuda.synchronize()  # Wait for completion
-                end_time = time.time()
-                triton_times.append((end_time - start_time) * 1000)  # ms
-
-            # Rest briefly between implementations
-            time.sleep(sleep_time)
-
-            # Benchmark PyTorch reference
-            for _ in range(num_trials):
-                torch.cuda.synchronize()
-                start_time = time.time()
-                pytorch_result = torch_associative_scan_reference(torch_gated_Z, torch_gates)
-                torch.cuda.synchronize()
-                end_time = time.time()
-                pytorch_times.append((end_time - start_time) * 1000)  # ms
-
-            # Rest briefly between implementations
-            time.sleep(sleep_time)
-
-            # Benchmark JAX
-            for _ in range(num_trials):
-                start_time = time.time()
-                jax_result = jax_scan_fn(jax_gated_Z, jax_gates)
-                jax.block_until_ready(jax_result)  # Proper sync
-                end_time = time.time()
-                jax_times.append((end_time - start_time) * 1000)  # ms
-
-            # Compute statistics
-            triton_mean = sum(triton_times) / len(triton_times)
-            triton_std = (sum((t - triton_mean) ** 2 for t in triton_times) / len(triton_times)) ** 0.5
-
-            jax_mean = sum(jax_times) / len(jax_times)
-            jax_std = (sum((t - jax_mean) ** 2 for t in jax_times) / len(jax_times)) ** 0.5
-
-            pytorch_mean = sum(pytorch_times) / len(pytorch_times)
-            pytorch_std = (sum((t - pytorch_mean) ** 2 for t in pytorch_times) / len(pytorch_times)) ** 0.5
-
-            # Compute speedup ratios (lower numbers are better for Triton)
-            jax_speedup = jax_mean / triton_mean
-            pytorch_speedup = pytorch_mean / triton_mean
-
-            # Print results
-            size_str = f"({B},{F},{S})"
-            triton_str = f"{triton_mean:.2f}±{triton_std:.2f}"
-            jax_str = f"{jax_mean:.2f}±{jax_std:.2f}"
-            pytorch_str = f"{pytorch_mean:.2f}±{pytorch_std:.2f}"
-            jax_speedup_str = f"{jax_speedup:.2f}x"
-            pytorch_speedup_str = f"{pytorch_speedup:.2f}x"
-
-            print(
-                f"{size_str:<20} {triton_str:<15} {jax_str:<15} {pytorch_str:<15} {jax_speedup_str:<10} {pytorch_speedup_str:<10}"
+            triton_fwd_bwd_time = do_bench(
+                triton_fwd_bwd_fn,
+                grad_to_none=[torch_gated_Z, torch_gates],
+                warmup=num_warmup,
+                rep=num_trials,
+                fast_flush=False,
             )
+            triton_multiplier = triton_fwd_bwd_time / triton_fwd_time if triton_fwd_time > 0 else float("inf")
+
+            # JAX benchmarks
+            jax_fwd_fn = lambda: jax_scan_fn(jax_gated_Z, jax_gates)
+            jax_fwd_time = jax_bench(jax_fwd_fn, warmup=num_warmup, rep=num_trials)
+
+            def jax_loss_fn(z, g):
+                out_z, out_g = jax_scan_fn(z, g)
+                return jnp.sum(out_z) + jnp.sum(out_g)
+
+            jax_grad_fn = jax.grad(jax_loss_fn, argnums=(0, 1))
+
+            def jax_fwd_bwd_fn():
+                fwd_result = jax_fwd_fn()
+                grad_result = jax_grad_fn(jax_gated_Z, jax_gates)
+                return fwd_result, grad_result
+
+            jax_fwd_bwd_time = jax_bench(jax_fwd_bwd_fn, warmup=num_warmup, rep=num_trials)
+            jax_multiplier = jax_fwd_bwd_time / jax_fwd_time if jax_fwd_time > 0 else float("inf")
+
+            # PyTorch benchmarks
+            pytorch_fwd_fn = lambda: torch_associative_scan_reference(torch_gated_Z, torch_gates)
+            pytorch_fwd_time = do_bench(pytorch_fwd_fn, warmup=num_warmup, rep=num_trials, fast_flush=False)
+
+            def pytorch_fwd_bwd_fn():
+                out_z, out_g = torch_associative_scan_reference(torch_gated_Z, torch_gates)
+                loss = (out_z.sum() + out_g.sum()) * 1.0
+                loss.backward()
+
+            pytorch_fwd_bwd_time = do_bench(
+                pytorch_fwd_bwd_fn,
+                grad_to_none=[torch_gated_Z, torch_gates],
+                warmup=num_warmup,
+                rep=num_trials,
+                fast_flush=False,
+            )
+            pytorch_multiplier = pytorch_fwd_bwd_time / pytorch_fwd_time if pytorch_fwd_time > 0 else float("inf")
+
+            # Revised results print statement
+            results_line = (
+                f"({B},{F},{S})".ljust(18)
+                + "| "
+                + f"{triton_fwd_time:^12.2f}{triton_fwd_bwd_time:^12.2f}{triton_multiplier:^10.2f} | "
+                + f"{jax_fwd_time:^12.2f}{jax_fwd_bwd_time:^12.2f}{jax_multiplier:^10.2f} | "
+                + f"{pytorch_fwd_time:^12.2f}{pytorch_fwd_bwd_time:^12.2f}{pytorch_multiplier:^10.2f}"
+            )
+            print(results_line)
+            time.sleep(sleep_time)
 
     print("\nBenchmark complete!")
 
 
-# Function to profile memory usage - update references from PyTorch to JAX
 def profile_memory_usage(configs=None, dtype=torch.float32):
-    """Profile memory usage of both implementations"""
-    if configs is None:
-        configs = [
-            (16, 8, 32),
-            (32, 16, 64),
-            (64, 32, 128),
-            (128, 64, 256),
-            (256, 32, 512),
-            (64, 64, 1024),
-        ]
+    """Profile memory usage of associative scan implementations.
 
+    Args:
+        configs: List of (batch, features, sequence length) tuples.
+        dtype: Data type to test.
+    """
+    configs = configs or [
+        (16, 8, 32),
+        (32, 16, 64),
+        (64, 32, 128),
+        (128, 64, 256),
+        (256, 32, 512),
+        (64, 64, 1024),
+        (16, 32, 8192),
+    ]
     device = torch.device("cuda")
+    jax_device = jax.devices("gpu")[0] if jax.devices("gpu") else None
     jax_dtype = jnp.float32 if dtype == torch.float32 else jnp.bfloat16
 
-    print(f"\nProfiling memory usage with {dtype}:")
-    print(f"{'Size (B,F,S)':<20} {'Input Size (MB)':<20} {'Triton (MB)':<15} {'JAX (MB)':<15}")
-    print("-" * 70)
+    print(f"\nMemory Profiling ({dtype}):")
+    print(f"{'Shape (B,F,S)':<20} {'Input (MB)':<15} {'Triton (MB)':<15} {'JAX (MB)':<15} {'PyTorch (MB)':<15}")
+    print("-" * 80)
 
     for B, F, S in configs:
-        # Calculate theoretical input size
-        input_size_bytes = 2 * B * F * S * dtype.itemsize  # Both gated_Z and gates
-        input_size_mb = input_size_bytes / (1024 * 1024)
+        input_size_mb = 2 * B * F * S * dtype.itemsize / (1024 * 1024)
 
-        # Create inputs
+        # Triton memory
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        torch.manual_seed(42)
         gated_Z = torch.rand(B, F, S, device=device, dtype=dtype)
         gates = torch.rand(B, F, S, device=device, dtype=dtype)
+        torch.cuda.synchronize()
         baseline = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        triton_fn = lambda: triton_associative_scan(gated_Z, gates)
+        _, triton_mem = do_bench(triton_fn, warmup=25, rep=100, fast_flush=False, return_mem=True)
+        triton_mem = max(0, triton_mem - baseline)
 
-        # Measure Triton memory usage
+        # JAX memory
+        jax.clear_caches()
+        jax_gated_Z = jax.device_put(
+            jax.random.uniform(jax.random.PRNGKey(42), (B, F, S), dtype=jax_dtype), device=jax_device
+        )
+        jax_gates = jax.device_put(
+            jax.random.uniform(jax.random.PRNGKey(43), (B, F, S), dtype=jax_dtype), device=jax_device
+        )
+        baseline_mem = (
+            jax.device_get(jax.devices("gpu")[0].memory_stats())["bytes_in_use"] / (1024 * 1024) if jax_device else 0
+        )
+        with jax.profiler.TraceAnnotation("jax_scan"):
+            result = jax_scan_fn(jax_gated_Z, jax_gates)
+            jax.block_until_ready(result)
+        peak_mem = (
+            jax.device_get(jax.devices("gpu")[0].memory_stats())["bytes_in_use"] / (1024 * 1024) if jax_device else 0
+        )
+        jax_mem = max(0, peak_mem - baseline_mem)
+
+        # PyTorch memory
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        _ = triton_associative_scan(gated_Z, gates)
-        triton_mem = torch.cuda.max_memory_allocated() / (1024 * 1024) - baseline
+        torch.cuda.synchronize()
+        baseline = torch.cuda.max_memory_allocated() / (1024 * 1024)
+        pytorch_fn = lambda: torch_associative_scan_reference(gated_Z, gates)
+        _, pytorch_mem = do_bench(pytorch_fn, warmup=25, rep=100, fast_flush=False, return_mem=True)
+        pytorch_mem = max(0, pytorch_mem - baseline)
 
-        # JAX memory usage is more complex to measure accurately from PyTorch
-        # For now just report N/A
-        jax_mem = "N/A"
-
-        # Print results
-        size_str = f"({B},{F},{S})"
-        input_str = f"{input_size_mb:.2f}"
-        triton_str = f"{triton_mem:.2f}"
-
-        print(f"{size_str:<20} {input_str:<20} {triton_str:<15} {jax_mem:<15}")
-
-    print("\nMemory profiling complete!")
+        print(
+            f"({B},{F},{S})".ljust(20)
+            + f"{input_size_mb:<15.2f}{triton_mem:<15.2f}{jax_mem:<15.2f}{pytorch_mem:<15.2f}"
+        )
 
 
 def run_comprehensive_benchmarks():
-    """Run both correctness tests and performance benchmarks."""
-    print("=" * 80)
-    print("ASSOCIATIVE SCAN BENCHMARK SUITE")
-    print("=" * 80)
-
-    # Skip correctness tests since test_triton_vs_jax was removed
-    # Run performance benchmarks directly
-    print("\n1. PERFORMANCE BENCHMARKING")
-    print("-" * 80)
-    benchmark_scan_implementations(dtypes=[torch.float32, torch.bfloat16], num_warmup=5, num_trials=20, sleep_time=0.1)
-
-    # Profile memory usage
-    print("\n2. MEMORY USAGE PROFILING")
-    print("-" * 80)
+    """Run comprehensive benchmarks for associative scan implementations."""
+    print(f"\n{'=' * 80}\nAssociative Scan Benchmarks ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})\n{'=' * 80}")
+    print("\n1. Performance Benchmarks")
+    print("-" * 50)
+    benchmark_scan_implementations(
+        dtypes=[torch.float32, torch.bfloat16], num_warmup=25, num_trials=100, sleep_time=0.1
+    )
+    print("\n2. Memory Usage Benchmarks")
+    print("-" * 50)
     profile_memory_usage()
-
-    print("\n" + "=" * 80)
-    print("BENCHMARK SUITE COMPLETED")
-    print("=" * 80)
-
-
-# Optional: Visualization function if matplotlib is available
-def visualize_benchmark_results(configs, triton_times, pytorch_times, dtype):
-    """Generate visualization of benchmark results"""
-    try:
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        labels = [f"({B},{F},{S})" for B, F, S in configs]
-        x = np.arange(len(labels))
-        width = 0.35
-
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.bar(x - width / 2, triton_times, width, label="Triton")
-        ax.bar(x + width / 2, pytorch_times, width, label="PyTorch")
-
-        # Add speedup annotations
-        for i in range(len(triton_times)):
-            speedup = pytorch_times[i] / triton_times[i]
-            ax.text(i, max(triton_times[i], pytorch_times[i]) + 0.1, f"{speedup:.2f}x", ha="center", va="bottom")
-
-        ax.set_ylabel("Time (ms)")
-        ax.set_title(f"Associative Scan Performance ({dtype})")
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=45)
-        ax.legend()
-
-        plt.tight_layout()
-        plt.savefig(f"scan_benchmark_{dtype}.png")
-        print(f"Visualization saved to scan_benchmark_{dtype}.png")
-
-    except ImportError:
-        print("Matplotlib not available for visualization")
+    print(f"\n{'=' * 80}\nBenchmarks Completed\n{'=' * 80}")
 
 
 def main():

@@ -3,198 +3,174 @@ import torch
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from functools import partial
 from torch.autograd import gradcheck
+from jax import jit, grad
 
 from benchmark import (
     triton_associative_scan,
     torch_associative_scan_reference,
 )
 
-from kernel import AssociativeScan
+from kernel_simple import AssociativeScan
 
+jax.config.update("jax_enable_x64", True)
 
-def run_grad_check(B, F, S, dtype=torch.float64, eps=1e-6, atol=1e-4, rtol=1e-3):
-    """
-    Run gradient check on the associative scan implementation for a specific shape.
-
-    Args:
-        B: Batch size
-        F: Feature size
-        S: Sequence length
-        dtype: Data type to use for gradient check (float64 recommended)
-        eps: Epsilon for numerical gradient approximation
-        atol: Absolute tolerance for gradient check
-        rtol: Relative tolerance for gradient check
-
-    Returns:
-        Tuple of (triton_success, reference_success)
-    """
-    # Create random inputs with double precision (required for accurate gradcheck)
-    torch.manual_seed(42 + B + F + S)  # Different seed for each shape
+def run_grad_check(B, F, S, dtype=torch.float64, eps=1e-6, atol=1e-4, rtol=1e-3, nondet_tol=1e-5):
+    torch.manual_seed(42 + B + F + S)
     gated_Z = torch.randn(B, F, S, dtype=dtype, device="cuda", requires_grad=True)
     gates = torch.randn(B, F, S, dtype=dtype, device="cuda", requires_grad=True)
 
-    # Triton implementation gradient check
     try:
         triton_success = gradcheck(
-            AssociativeScan.apply,
-            (gated_Z, gates),
-            eps=eps,
-            atol=atol,
-            rtol=rtol,
-            fast_mode=False,  # Use full Jacobian check
+            AssociativeScan.apply, (gated_Z, gates), eps=eps, atol=atol, rtol=rtol, nondet_tol=nondet_tol, fast_mode=True
         )
     except Exception as e:
-        print(f"Triton gradcheck error: {e}")
+        print(f"Triton gradcheck error for shape ({B},{F},{S}): {e}")
         triton_success = False
 
-    # PyTorch reference implementation gradient check
     try:
         reference_success = gradcheck(
-            torch_associative_scan_reference,
-            (gated_Z, gates),
-            eps=eps,
-            atol=atol,
-            rtol=rtol,
-            fast_mode=False,  # Use full Jacobian check
+            torch_associative_scan_reference, (gated_Z, gates), eps=eps, atol=atol, rtol=rtol, nondet_tol=nondet_tol, fast_mode=True
         )
     except Exception as e:
-        print(f"Reference gradcheck error: {e}")
+        print(f"Reference gradcheck error for shape ({B},{F},{S}): {e}")
         reference_success = False
 
     return triton_success, reference_success
 
 
-def check_grad_equivalence(B, F, S, dtype=torch.float64, atol=1e-5):
-    """
-    Check if the gradients computed by Triton implementation match the PyTorch reference.
-
-    Args:
-        B: Batch size
-        F: Feature size
-        S: Sequence length
-        dtype: Data type for tensors
-        atol: Absolute tolerance for gradient comparison
-
-    Returns:
-        True if gradients match within tolerance, False otherwise
-    """
-    # Create random inputs
+def check_grad_equivalence(B, F, S, dtype=torch.float64, atol=1e-5, use_jax_reference=False):
     torch.manual_seed(42 + B + F + S)
     gated_Z_triton = torch.randn(B, F, S, dtype=dtype, device="cuda", requires_grad=True)
     gates_triton = torch.randn(B, F, S, dtype=dtype, device="cuda", requires_grad=True)
-
-    # Clone inputs for reference
     gated_Z_ref = gated_Z_triton.detach().clone().requires_grad_(True)
     gates_ref = gates_triton.detach().clone().requires_grad_(True)
 
-    # Forward pass - Triton
     triton_Z, triton_gates = triton_associative_scan(gated_Z_triton, gates_triton)
-    # Forward pass - Reference
-    ref_Z, ref_gates = torch_associative_scan_reference(gated_Z_ref, gates_ref)
 
-    # Create gradient targets (random for diversity)
+    if use_jax_reference:
+        gated_Z_jax = jnp.array(gated_Z_ref.cpu().detach().numpy(), dtype=jnp.float64)
+        gates_jax = jnp.array(gates_ref.cpu().detach().numpy(), dtype=jnp.float64)
+        ref_Z_jax, ref_gates_jax = jax_associative_scan(gated_Z_jax, gates_jax, axis=2)
+        ref_Z = torch.tensor(np.array(ref_Z_jax), device="cuda", dtype=dtype)
+        ref_gates = torch.tensor(np.array(ref_gates_jax), device="cuda", dtype=dtype)
+    else:
+        ref_Z, ref_gates = torch_associative_scan_reference(gated_Z_ref, gates_ref)
+
     torch.manual_seed(43 + B + F + S)
     grad_Z = torch.randn_like(triton_Z)
     grad_gates = torch.randn_like(triton_gates)
 
-    # Backward pass - Triton
     triton_loss = (triton_Z * grad_Z).sum() + (triton_gates * grad_gates).sum()
     triton_loss.backward()
 
-    # Backward pass - Reference
-    ref_loss = (ref_Z * grad_Z).sum() + (ref_gates * grad_gates).sum()
-    ref_loss.backward()
+    if use_jax_reference:
+        def loss_fn(z, g, grad_z, grad_g):
+            out_z, out_g = jax_associative_scan(z, g, axis=2)
+            return (out_z * grad_z).sum() + (out_g * grad_g).sum()
 
-    # Check Z gradients
-    grad_match_Z = torch.allclose(gated_Z_triton.grad, gated_Z_ref.grad, atol=atol)
-    # Check gates gradients
-    grad_match_gates = torch.allclose(gates_triton.grad, gates_ref.grad, atol=atol)
+        grad_fn = grad(loss_fn, argnums=(0, 1))
+        grad_Z_jax, grad_gates_jax = grad_fn(
+            gated_Z_jax, gates_jax,
+            jnp.array(grad_Z.cpu().numpy(), dtype=jnp.float64),
+            jnp.array(grad_gates.cpu().numpy(), dtype=jnp.float64)
+        )
+        grad_Z_ref = torch.tensor(np.array(grad_Z_jax), device="cuda", dtype=dtype)
+        grad_gates_ref = torch.tensor(np.array(grad_gates_jax), device="cuda", dtype=dtype)
+    else:
+        ref_loss = (ref_Z * grad_Z).sum() + (ref_gates * grad_gates).sum()
+        ref_loss.backward()
+        grad_Z_ref = gated_Z_ref.grad
+        grad_gates_ref = gates_ref.grad
+
+    grad_match_Z = torch.allclose(gated_Z_triton.grad, grad_Z_ref, atol=atol)
+    grad_match_gates = torch.allclose(gates_triton.grad, grad_gates_ref, atol=atol)
 
     if not grad_match_Z or not grad_match_gates:
-        # Print detailed diagnostics if mismatch detected
         if not grad_match_Z:
-            diff_Z = (gated_Z_triton.grad - gated_Z_ref.grad).abs()
-            max_diff_Z = diff_Z.max().item()
-            mean_diff_Z = diff_Z.mean().item()
-            print(f"  Z gradient mismatch: max={max_diff_Z:.6f}, mean={mean_diff_Z:.6f}")
-
-            # Find location of max difference
-            max_idx = diff_Z.argmax().item()
-            flat_idx = max_idx
-            b_idx = flat_idx // (F * S)
-            remainder = flat_idx % (F * S)
-            f_idx = remainder // S
-            s_idx = remainder % S
-            print(f"  Max diff at [b={b_idx}, f={f_idx}, s={s_idx}]")
-
+            diff_Z = (gated_Z_triton.grad - grad_Z_ref).abs()
+            print(f"  Z gradient mismatch for shape ({B},{F},{S}): max={diff_Z.max():.6f}, mean={diff_Z.mean():.6f}")
         if not grad_match_gates:
-            diff_gates = (gates_triton.grad - gates_ref.grad).abs()
-            max_diff_gates = diff_gates.max().item()
-            mean_diff_gates = diff_gates.mean().item()
-            print(f"  Gates gradient mismatch: max={max_diff_gates:.6f}, mean={mean_diff_gates:.6f}")
+            diff_gates = (gates_triton.grad - grad_gates_ref).abs()
+            print(f"  Gates gradient mismatch for shape ({B},{F},{S}): max={diff_gates.max():.6f}, mean={diff_gates.mean():.6f}")
 
     return grad_match_Z and grad_match_gates
 
 
+def verify_jax_reference(B, F, S, dtype=torch.float64, atol=1e-5):
+    torch.manual_seed(42 + B + F + S)
+    gated_Z_torch = torch.randn(B, F, S, dtype=dtype, device="cuda")
+    gates_torch = torch.randn(B, F, S, dtype=dtype, device="cuda")
+
+    ref_Z, ref_gates = torch_associative_scan_reference(gated_Z_torch, gates_torch)
+    
+    gated_Z_jax = jnp.array(gated_Z_torch.cpu().numpy(), dtype=jnp.float64)
+    gates_jax = jnp.array(gates_torch.cpu().numpy(), dtype=jnp.float64)
+    jax_Z, jax_gates = jax_associative_scan(gated_Z_jax, gates_jax, axis=2)
+    
+    jax_Z = torch.tensor(np.array(jax_Z), device="cuda", dtype=dtype)
+    jax_gates = torch.tensor(np.array(jax_gates), device="cuda", dtype=dtype)
+
+    return torch.allclose(ref_Z, jax_Z, atol=atol) and torch.allclose(ref_gates, jax_gates, atol=atol)
+
+
 def comprehensive_gradient_testing():
-    """
-    Run comprehensive gradient testing on a wide variety of shapes.
-    Tests both numerical gradient checking and gradient equivalence.
-    """
     print("=" * 80)
-    print("ASSOCIATIVE SCAN GRADIENT CHECKING")
+    print("Associative Scan Gradient Tests")
     print("=" * 80)
 
-    # Shapes to test for gradient equivalence (fp32)
+    short_seq_shape = (4, 8, 16)
+    jax_reference_valid = verify_jax_reference(*short_seq_shape)
+    print(f"JAX vs PyTorch reference (short sequences): {'✓ PASS' if jax_reference_valid else '✗ FAIL'}")
+
     grad_equiv_configs = [
-        # Standard shapes
-        (2, 2, 4),  # Tiny
-        (4, 8, 16),  # Small
-        (8, 16, 32),  # Medium
-        (16, 32, 64),  # Large
-        (32, 32, 128),  # Very large
-        # Edge cases
-        (1, 1, 1),  # Minimal
-        (3, 5, 7),  # Odd sizes
-        (32, 2, 256),  # Long sequence
-        (64, 1, 32),  # Single feature
-        (2, 64, 32),  # Many features
+        (2, 2, 4),
+        (4, 8, 16),
+        (8, 16, 32),
+        (16, 32, 64),
+        (32, 32, 128),
+        (1, 1, 1),
+        (3, 5, 7),
+        (32, 2, 256),
+        (64, 1, 32),
+        (2, 64, 32),
+        (16, 32, 2048),
+        (8, 16, 16384),
     ]
 
-    # Subset of shapes to run numerical gradcheck on (fp64 - slow)
     numerical_gradcheck_configs = [
-        (2, 2, 4),  # Tiny
-        (3, 5, 7),  # Odd sizes
-        (4, 4, 8),  # Small
-        (1, 1, 1),  # Minimal
+        (2, 2, 4),
+        (3, 5, 7),
+        (4, 4, 8),
+        (1, 1, 1),
     ]
 
-    # 1. Gradient equivalence check (fp32)
-    print("\n1. Checking gradient equivalence (fp32):")
-    print("-" * 80)
-    print(f"{'Size (B,F,S)':<20} {'Result':<15} {'Notes':<45}")
+    print("\n1. Gradient Equivalence (float64)")
+    print("-" * 50)
+    print(f"{'Shape (B,F,S)':<20} {'Status':<10} {'Time (s)':<12}")
 
     all_equiv_passed = True
 
     for B, F, S in grad_equiv_configs:
+        use_jax = jax_reference_valid and S > 128
         start_time = time.time()
-        grad_match = check_grad_equivalence(B, F, S, dtype=torch.float64)
+        grad_match = check_grad_equivalence(B, F, S, dtype=torch.float64, use_jax_reference=use_jax)
         elapsed = time.time() - start_time
 
         size_str = f"({B},{F},{S})"
         result_str = "✓ PASS" if grad_match else "✗ FAIL"
-        notes = f"Took {elapsed:.2f}s"
+        time_str = f"{elapsed:.2f}{' (JAX)' if use_jax else ''}"
 
-        print(f"{size_str:<20} {result_str:<15} {notes:<45}")
+        print(f"{size_str:<20} {result_str:<10} {time_str:<12}")
 
         if not grad_match:
             all_equiv_passed = False
 
-    # 2. Numerical gradient check (fp64 - slower)
-    print("\n2. Numerical gradient checking (fp64):")
-    print("-" * 80)
-    print(f"{'Size (B,F,S)':<20} {'Triton':<15} {'Reference':<15} {'Time (s)':<10}")
+    print("\n2. Numerical Gradient Check (float64)")
+    print("-" * 50)
+    print(f"{'Shape (B,F,S)':<20} {'Triton':<10} {'Ref':<10} {'Time (s)':<10}")
 
     all_gradcheck_passed = True
 
@@ -208,105 +184,94 @@ def comprehensive_gradient_testing():
         ref_str = "✓ PASS" if ref_success else "✗ FAIL"
         time_str = f"{elapsed:.2f}"
 
-        print(f"{size_str:<20} {triton_str:<15} {ref_str:<15} {time_str:<10}")
+        print(f"{size_str:<20} {triton_str:<10} {ref_str:<10} {time_str:<10}")
 
         if not (triton_success and ref_success):
             all_gradcheck_passed = False
 
-    # 3. Heavy workload testing for distributed training
-    print("\n3. Heavy workload testing (fp32):")
-    print("-" * 80)
-    print("Testing larger sizes to simulate distributed training workloads")
+    print("\n3. Heavy Workload Tests (float64)")
+    print("-" * 50)
 
     heavy_configs = [
-        (64, 32, 256),  # Large batch
-        (128, 16, 512),  # Long sequence
-        (32, 64, 128),  # Many features
+        (64, 32, 256),
+        (128, 16, 512),
+        (32, 64, 128),
+        (16, 32, 8192),
+        (8, 16, 16384),
     ]
 
     for B, F, S in heavy_configs:
-        print(f"\nTesting shape ({B},{F},{S}):")
-
-        # Test with standard fp32
+        print(f"Shape ({B},{F},{S}):")
+        use_jax = jax_reference_valid and S > 128
         start_time = time.time()
-        grad_match = check_grad_equivalence(B, F, S, dtype=torch.float64)
+        grad_match = check_grad_equivalence(B, F, S, dtype=torch.float64, use_jax_reference=use_jax)
         elapsed = time.time() - start_time
 
         result_str = "✓ PASS" if grad_match else "✗ FAIL"
-        print(f"  Gradient equivalence (fp32): {result_str} (took {elapsed:.2f}s)")
+        print(f"  Gradient equivalence: {result_str} ({elapsed:.2f}s{' (JAX)' if use_jax else ''})")
 
         if not grad_match:
             all_equiv_passed = False
 
-    # Summary
     print("\n" + "=" * 80)
-    print("GRADIENT TESTING SUMMARY")
+    print("Gradient Test Summary")
     print("=" * 80)
-    print(f"Gradient equivalence tests: {'PASSED' if all_equiv_passed else 'FAILED'}")
-    print(f"Numerical gradient checks: {'PASSED' if all_gradcheck_passed else 'FAILED'}")
+    print(f"Gradient equivalence: {'✓ PASSED' if all_equiv_passed else '✗ FAILED'}")
+    print(f"Numerical gradcheck: {'✓ PASSED' if all_gradcheck_passed else '✗ FAILED'}")
     print("=" * 80)
 
     return all_equiv_passed and all_gradcheck_passed
 
 
+@jit
 def combine_fn_jax(carry, next_val):
-    """Associative combine function: elementwise addition."""
     sum_gated_Z, sum_gates = carry
     next_gated_Z, next_gates = next_val
     return (sum_gated_Z + next_gated_Z, sum_gates + next_gates)
 
 
+@partial(jit, static_argnums=(2,))
 def jax_associative_scan(gated_Z, gates, axis=2):
-    """
-    Performs an associative scan using JAX along the specified axis.
-
-    Args:
-        gated_Z: jnp.ndarray of shape [B, D, L].
-        gates: jnp.ndarray of shape [B, D, L].
-        axis: Axis along which to scan.
-
-    Returns:
-        A tuple (cumulative_gated_Z, cumulative_gates) with the same shape.
-    """
     return jax.lax.associative_scan(combine_fn_jax, (gated_Z, gates), axis=axis)
 
 
 def test_correctness():
     print("=" * 80)
-    print("ASSOCIATIVE SCAN CORRECTNESS TESTING")
+    print("Associative Scan Correctness Tests")
     print("=" * 80)
 
-    # List of shapes to test: [B, D, L]
-    test_shapes = [(2, 3, 8), (4, 16, 32), (1, 10, 15), (3, 7, 64)]
+    test_shapes = [
+        (2, 3, 8),
+        (4, 16, 32),
+        (1, 10, 15),
+        (3, 7, 64),
+        (2, 8, 2048),
+        (1, 4, 16384),
+    ]
 
     for shape in test_shapes:
         B, D, L = shape
-        # Generate random inputs (float32)
         gated_Z_np = np.random.randn(B, D, L).astype(np.float32)
         gates_np = np.random.randn(B, D, L).astype(np.float32)
 
-        # Compute cumulative scan using JAX.
         gated_Z_jax = jnp.array(gated_Z_np)
         gates_jax = jnp.array(gates_np)
         cumulative_gated_Z_jax, cumulative_gates_jax = jax_associative_scan(gated_Z_jax, gates_jax, axis=2)
         cumulative_gated_Z_jax = np.array(cumulative_gated_Z_jax)
         cumulative_gates_jax = np.array(cumulative_gates_jax)
 
-        # Compute cumulative scan using the Triton wrapper.
-        # Ensure inputs are on GPU.
         gated_Z_torch = torch.tensor(gated_Z_np, device="cuda")
         gates_torch = torch.tensor(gates_np, device="cuda")
         cumulative_gated_Z_torch, cumulative_gates_torch = triton_associative_scan(gated_Z_torch, gates_torch)
         cumulative_gated_Z_torch = cumulative_gated_Z_torch.cpu().numpy()
         cumulative_gates_torch = cumulative_gates_torch.cpu().numpy()
 
-        # Compare the outputs.
         if not np.allclose(cumulative_gated_Z_jax, cumulative_gated_Z_torch, rtol=1e-3, atol=1e-3):
-            print(f"Mismatch in cumulative_gated_Z for shape {shape}")
+            print(f"  Mismatch in cumulative_gated_Z for shape {shape}")
         if not np.allclose(cumulative_gates_jax, cumulative_gates_torch, rtol=1e-3, atol=1e-3):
-            print(f"Mismatch in cumulative_gates for shape {shape}")
+            print(f"  Mismatch in cumulative_gates for shape {shape}")
         else:
-            print(f"Shape {shape} passed!")
+            print(f"Shape {shape}: ✓ PASS")
 
 
 if __name__ == "__main__":

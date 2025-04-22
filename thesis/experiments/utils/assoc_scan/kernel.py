@@ -5,7 +5,7 @@ import functools
 import itertools
 import sys
 from collections.abc import Sequence
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, List, Optional, Union, Tuple
 
 import numpy as np
 import torch
@@ -22,10 +22,7 @@ from torch._higher_order_ops.utils import (
     _maybe_run_with_interpreter,
     _set_compilation_env,
     reenter_make_fx,
-    save_tensors_and_symints_for_backward,
-    saved_tensors_and_symints,
     unique_graph_id,
-    validate_subgraph_args_types,
 )
 from torch.fx.passes.shape_prop import (
     _extract_tensor_metadata,
@@ -58,9 +55,7 @@ except ImportError:
 from thesis.experiments.utils.assoc_scan.aotautograd import create_bw_fn
 
 
-def autotune(
-    key=None, configs=None, warmup=25, rep=100, max_autotune_gemm=True, cache_key=None
-):
+def autotune(key=None, configs=None, warmup=25, rep=100, max_autotune_gemm=True, cache_key=None):
     r"""A convenient decorator for autotuning Triton kernels.
 
     Args:
@@ -105,16 +100,12 @@ def autotune(
         configs = []
 
         # If we have matrix-like dimensions and max_autotune_gemm is True
-        if max_autotune_gemm and any(
-            p in params for p in ["M", "N", "K", "B", "T", "D"]
-        ):
+        if max_autotune_gemm and any(p in params for p in ["M", "N", "K", "B", "T", "D"]):
             # Matrix multiplication-like configs (block sizes for different dimensions)
             for bs in [32, 64, 128, 256]:
                 configs.append(triton.Config({"BLOCK_SIZE": bs}, num_warps=4))
                 configs.append(triton.Config({"BLOCK_SIZE": bs}, num_warps=8))
-                configs.append(
-                    triton.Config({"BLOCK_SIZE": bs}, num_stages=2, num_warps=8)
-                )
+                configs.append(triton.Config({"BLOCK_SIZE": bs}, num_stages=2, num_warps=8))
         else:
             # Standard block size configs
             for bs in block_sizes:
@@ -140,9 +131,7 @@ def autotune(
                 ]
             )
 
-        print(
-            f"[Tiki Autotuner] Generated {len(configs)} configurations to test for '{fn.__name__}'"
-        )
+        print(f"[Tiki Autotuner] Generated {len(configs)} configurations to test for '{fn.__name__}'")
         return configs
 
     def get_default_key(fn):
@@ -167,9 +156,7 @@ def autotune(
             ]
             detected_keys = int_like_params[:2] if len(int_like_params) > 0 else []
 
-        print(
-            f"[Tiki Autotuner] Auto-detected key parameters for '{fn.__name__}': {detected_keys}"
-        )
+        print(f"[Tiki Autotuner] Auto-detected key parameters for '{fn.__name__}': {detected_keys}")
         return detected_keys
 
     def decorator(fn):
@@ -179,18 +166,14 @@ def autotune(
         if key is None:
             key = get_default_key(fn)
         else:
-            print(
-                f"[Tiki Autotuner] Using provided key parameters for '{fn.__name__}': {key}"
-            )
+            print(f"[Tiki Autotuner] Using provided key parameters for '{fn.__name__}': {key}")
 
         # Create default configs if not provided
         if configs is None:
             print(f"[Tiki Autotuner] Creating default configs for '{fn.__name__}'")
             configs = get_default_configs(fn)
         else:
-            print(
-                f"[Tiki Autotuner] Using {len(configs)} provided configs for '{fn.__name__}'"
-            )
+            print(f"[Tiki Autotuner] Using {len(configs)} provided configs for '{fn.__name__}'")
 
         # Store if we have already printed the best config for a given key value
         printed_configs = {}
@@ -202,16 +185,12 @@ def autotune(
             if current_key_tuple not in printed_configs:
                 print(
                     f"[Tiki Autotuner] Autotuning '{fn.__name__}' with key values: "
-                    + ", ".join(
-                        [f"{k}={args_dict.get(k)}" for k in key if k in args_dict]
-                    )
+                    + ", ".join([f"{k}={args_dict.get(k)}" for k in key if k in args_dict])
                 )
             return {}
 
         # Apply the Triton autotune decorator
-        print(
-            f"[Tiki Autotuner] Setting up autotuning for '{fn.__name__}' with {len(configs)} configs"
-        )
+        print(f"[Tiki Autotuner] Setting up autotuning for '{fn.__name__}' with {len(configs)} configs")
         autotuned_fn = triton.autotune(
             configs=configs,
             key=key,
@@ -226,9 +205,7 @@ def autotune(
         def wrapper(*args, **kwargs):
             # Construct the current key tuple from *args based on arg_names
             # This assumes key parameters are passed positionally and match the kernel signature
-            arg_names = (
-                autotuned_fn.arg_names
-            )  # Get arg names from the autotuned function
+            arg_names = autotuned_fn.arg_names  # Get arg names from the autotuned function
             args_dict = {**dict(zip(arg_names, args)), **kwargs}
             current_key_tuple = tuple(args_dict.get(k) for k in key if k in args_dict)
 
@@ -241,10 +218,7 @@ def autotune(
             )
 
             # Check if tuning occurred and we haven't printed this config yet
-            if (
-                hasattr(autotuned_fn, "best_config")
-                and autotuned_fn.best_config is not None
-            ):
+            if hasattr(autotuned_fn, "best_config") and autotuned_fn.best_config is not None:
                 if (
                     current_key_tuple not in printed_configs
                     or printed_configs[current_key_tuple] != autotuned_fn.best_config
@@ -257,9 +231,7 @@ def autotune(
                     )
                     printed_configs[current_key_tuple] = autotuned_fn.best_config
                 else:
-                    print(
-                        f"[Tiki Autotuner] Using cached config for '{fn.__name__}' (key={current_key_tuple})"
-                    )
+                    print(f"[Tiki Autotuner] Using cached config for '{fn.__name__}' (key={current_key_tuple})")
 
             return result
 
@@ -394,19 +366,11 @@ def bwd_grad_scan(
     base_offset = pid_b * stride_b + pid_d * stride_d
     rev_offsets = T - 1 - offsets  # Do reverse indexing in kernel
 
-    g_h_rev = tl.load(
-        g_h_ptr + base_offset + rev_offsets * stride_t, mask=mask, other=1.0
-    )
-    g_ys_rev = tl.load(
-        g_ys_ptr + base_offset + rev_offsets * stride_t, mask=mask, other=0.0
-    )
-    g_x_rev = tl.load(
-        g_x_ptr + base_offset + rev_offsets * stride_t, mask=mask, other=0.0
-    )
+    g_h_rev = tl.load(g_h_ptr + base_offset + rev_offsets * stride_t, mask=mask, other=1.0)
+    g_ys_rev = tl.load(g_ys_ptr + base_offset + rev_offsets * stride_t, mask=mask, other=0.0)
+    g_x_rev = tl.load(g_x_ptr + base_offset + rev_offsets * stride_t, mask=mask, other=0.0)
 
-    chain_scan = tl.associative_scan(
-        g_h_rev, axis=0, combine_fn=combine_fn, reverse=False
-    )
+    chain_scan = tl.associative_scan(g_h_rev, axis=0, combine_fn=combine_fn, reverse=False)
     fused_result = chain_scan * g_ys_rev * g_x_rev
 
     tl.store(g_xs_ptr + base_offset + rev_offsets * stride_t, fused_result, mask=mask)
@@ -445,6 +409,44 @@ def launch_bwd_grad_scan(
 
     return g_xs
 
+
+def save_tensors_and_symints_for_backward(ctx, args):
+    assert all(
+        isinstance(arg, (torch.Tensor, torch.SymInt, int, type(None))) for arg in args
+    ), args
+    partitioned_args: List[Any] = [[], []]
+    pos = []
+    for i, arg in enumerate(args):
+        idx = 0 if isinstance(arg, torch.Tensor) else 1
+        partitioned_args[idx].append(arg)
+        pos.append(idx)
+
+    assert not hasattr(ctx, "sym_int_args"), "ctx already has sym_int_args attribute."
+    assert not hasattr(ctx, "pos"), "ctx already has pos attribute."
+    ctx.save_for_backward(*partitioned_args[0])
+    ctx.sym_int_args = partitioned_args[1]
+    ctx.pos = pos
+
+def saved_tensors_and_symints(ctx):
+    args = []
+    t_idx = 0
+    s_idx = 0
+    saved_tensors = ctx.saved_tensors
+    for p in ctx.pos:
+        if p == 0:
+            args.append(saved_tensors[t_idx])
+            t_idx += 1
+        else:
+            args.append(ctx.sym_int_args[s_idx])
+            s_idx += 1
+    assert t_idx + s_idx == len(ctx.pos)
+    return tuple(args)
+
+def validate_subgraph_args_types(lifted_args: Union[Tuple[Any, ...], List[Any]]):
+    allowed_types = (torch.Tensor, int, torch.SymInt)
+    assert all(
+        isinstance(arg, (torch.Tensor, int, torch.SymInt)) for arg in lifted_args
+    ), f"{lifted_args} can only be of {allowed_types} but got {tuple(type(arg) for arg in lifted_args)}"
 
 def _from_fun(t: Any) -> Any:
     r"""Materialize a tensor from a functional tensor if needed.
@@ -520,9 +522,7 @@ def materialize_as_graph(
     return gm
 
 
-def wrap_combine_fn_flat(
-    *args, combine_fn: Callable, spec: Any, num_leaves: int
-) -> list:
+def wrap_combine_fn_flat(*args, combine_fn: Callable, spec: Any, num_leaves: int) -> list:
     r"""Wrap and flatten the combine function across PyTree leaves.
 
     Args:
@@ -561,11 +561,7 @@ def _interleave(a: torch.Tensor, b: torch.Tensor, dim: int = 0) -> torch.Tensor:
     """
     b_trunc = a.shape[dim] == b.shape[dim] + 1
     if b_trunc:
-        pad = (
-            [0] * ((b.ndim - dim - 1) * 2 + 1)
-            + [1]
-            + [0] * (b.ndim * 2 - ((b.ndim - dim - 1) * 2 + 2))
-        )
+        pad = [0] * ((b.ndim - dim - 1) * 2 + 1) + [1] + [0] * (b.ndim * 2 - ((b.ndim - dim - 1) * 2 + 2))
         b = torch.nn.functional.pad(b, pad)
     stacked = torch.stack([a, b], dim=dim + 1)
     interleaved = torch.flatten(stacked, start_dim=dim, end_dim=dim + 1)
@@ -610,9 +606,7 @@ def get_tensor_mask(tensor_list: list[Any]) -> list[bool]:
     return [isinstance(v, torch.Tensor) for v in tensor_list]
 
 
-def mask_list(
-    mask: list[bool], inp: list[Any], other: Optional[list[Any]] = None
-) -> list[Any]:
+def mask_list(mask: list[bool], inp: list[Any], other: Optional[list[Any]] = None) -> list[Any]:
     r"""Mask elements of a list based on a boolean mask.
 
     Args:
@@ -635,6 +629,7 @@ def mask_list(
 
 def first_slice_copy(t: torch.Tensor, dim: int = 0) -> torch.Tensor:
     return t.select(dim, 0).clone()
+
 
 def first_slice_copy_with_grad(li: list[Any]) -> list[Any]:
     r"""Create first-slice copies of tensors with gradient information preserved.
@@ -667,9 +662,7 @@ def split_into_chunks(iterable: Sequence[Any], chunk_sizes: list[int]) -> list:
     """
     it = iter(iterable)
     if sum(chunk_sizes) != len(iterable):
-        raise AssertionError(
-            "Sum of chunk sizes must equal the length of the iterable."
-        )
+        raise AssertionError("Sum of chunk sizes must equal the length of the iterable.")
     return [list(itertools.islice(it, size)) for size in chunk_sizes]
 
 
@@ -744,9 +737,7 @@ def associative_scan(
     if not isinstance(dim, int):
         raise ValueError(f"Dim must be an int, but got {type(dim)}")
     if combine_mode not in ["pointwise", "generic"]:
-        raise ValueError(
-            f"Combine_mode must be 'pointwise' or 'generic', but got {combine_mode}"
-        )
+        raise ValueError(f"Combine_mode must be 'pointwise' or 'generic', but got {combine_mode}")
 
     if not torch.compiler.is_compiling():
         with _set_compilation_env(), torch._dynamo.utils.disable_cache_limit():
@@ -755,20 +746,14 @@ def associative_scan(
             )
 
     leaves, spec = pytree.tree_flatten(xs)
-    if combine_mode == "pointwise" and not all(
-        leaf.device.type == "cuda" for leaf in leaves
-    ):
-        raise ValueError(
-            "For combine_mode='pointwise', all input tensors must be on CUDA."
-        )
+    if combine_mode == "pointwise" and not all(leaf.device.type == "cuda" for leaf in leaves):
+        raise ValueError("For combine_mode='pointwise', all input tensors must be on CUDA.")
     if len(leaves) == 0:
         raise ValueError("Expected at least one xs leaf.")
     if any(not isinstance(x, torch.Tensor) for x in leaves):
         raise ValueError("All xs leaves must be Tensors.")
     if any(x.is_sparse for x in leaves):
-        raise ValueError(
-            "All xs leaves must be dense Tensors. Consider using `to_dense()`."
-        )
+        raise ValueError("All xs leaves must be dense Tensors. Consider using `to_dense()`.")
     if any(x.ndim <= dim or x.shape[dim] == 0 for x in leaves):
         raise ValueError("Each xs leaf must have a valid dimension for scanning.")
 
@@ -790,17 +775,25 @@ def associative_scan(
     out_leaves = pytree.tree_leaves(out)
     if len(leaves) != len(out_leaves):
         raise RuntimeError("Output PyTree structure must match input structure.")
-    for x, x_sliced in zip(out_leaves, sliced_leaves):
-        if (
-            x.shape != x_sliced.shape
-            or x.dtype != x_sliced.dtype
-            or x.device != x_sliced.device
-            or x.stride() != x_sliced.stride()
-        ):
-            raise RuntimeError(
-                f"Output metadata mismatch:\nxs: {(x_sliced.shape, x_sliced.dtype, x_sliced.device, x_sliced.stride())}\n"
-                f"operator output: {(x.shape, x.dtype, x.device, x.stride())}"
-            )
+    # Collect any per‑leaf metadata problems and report them at once
+    metadata_errs: list[str] = []
+
+    for i, (out, ref) in enumerate(zip(out_leaves, sliced_leaves)):
+        problems: list[str] = []
+
+        if out.shape   != ref.shape:   problems.append(f"shape {tuple(out.shape)} ≠ {tuple(ref.shape)}")
+        # Allow autocasting for now
+        # if out.dtype    is not ref.dtype:    problems.append(f"dtype {out.dtype} ≠ {ref.dtype}")
+        if out.device  != ref.device:  problems.append(f"device {out.device} ≠ {ref.device}")
+        if out.stride() != ref.stride(): problems.append(f"stride {out.stride()} ≠ {ref.stride()}")
+
+        if problems:
+            # prepend leaf index so we know which tensor failed
+            metadata_errs.append(f"leaf {i}: " + "; ".join(problems))
+
+    if metadata_errs:
+        details = "\n  • ".join(metadata_errs)
+        raise RuntimeError(f"Tensor metadata mismatch(es):\n  • {details}")
 
     if combine_mode == "generic":
         # The generic_associative_scan implementation calls the combine_fn with a `batch` along the scan dimension
@@ -846,9 +839,7 @@ def associative_scan(
     return pytree.tree_unflatten(result_flat, spec)
 
 
-def generic_associative_scan(
-    operator: Callable, leaves: list, dim: int = 0, additional_inputs=()
-) -> list:
+def generic_associative_scan(operator: Callable, leaves: list, dim: int = 0, additional_inputs=()) -> list:
     r"""A generic associative scan implementation using a recursive strategy.
 
     Args:
@@ -923,16 +914,12 @@ def generic_associative_scan(
             else aten.slice(elem, dim, 0, 1)
             for (elem, result) in zip(elems, even_elems)
         ]
-        return list(
-            safe_map(functools.partial(_interleave, dim=dim), even_elems, odd_elems)
-        )
+        return list(safe_map(functools.partial(_interleave, dim=dim), even_elems, odd_elems))
 
     return _scan(leaves)
 
 
-def diff_tensor_meta(
-    meta1: TensorMetadata, meta2: TensorMetadata, check_grad: bool = True
-) -> list[str]:
+def diff_tensor_meta(meta1: TensorMetadata, meta2: TensorMetadata, check_grad: bool = True) -> list[str]:
     """
     Compare two TensorMetadata instances and return differences.
 
@@ -989,21 +976,14 @@ def check_meta_consistency(
                         check_grad=False,
                     )
                 )
-            elif isinstance(lhs, (int, torch.SymInt)) and isinstance(
-                rhs, (int, torch.SymInt)
-            ):
+            elif isinstance(lhs, (int, torch.SymInt)) and isinstance(rhs, (int, torch.SymInt)):
                 return ""
             return f"type: {lhs} vs {rhs}"
 
         def diff_device(lhs, rhs) -> str:
             if isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
                 return (
-                    ""
-                    if (
-                        rhs.device.type == lhs.device.type
-                        and rhs.device.index == lhs.device.index
-                    )
-                    else "device"
+                    "" if (rhs.device.type == lhs.device.type and rhs.device.index == lhs.device.index) else "device"
                 )
             return ""
 
@@ -1014,13 +994,9 @@ def check_meta_consistency(
         all_diffs = []
         for i, (lhs, rhs) in enumerate(zip(lhs_list, rhs_list)):
             if diff := diff_meta(lhs, rhs):
-                all_diffs.append(
-                    f"pair[{i}] differ in {diff}, where lhs is {lhs} and rhs is {rhs}"
-                )
+                all_diffs.append(f"pair[{i}] differ in {diff}, where lhs is {lhs} and rhs is {rhs}")
             if diff := diff_device(lhs, rhs):
-                all_diffs.append(
-                    f"pair[{i}] differ in {diff}, where lhs is {lhs} and rhs is {rhs}"
-                )
+                all_diffs.append(f"pair[{i}] differ in {diff}, where lhs is {lhs} and rhs is {rhs}")
         return all_diffs
 
     if all_diffs := diff_meta_pairs(lhs_list, rhs_list):
@@ -1067,16 +1043,12 @@ def trace_associative_scan(
     output_fake_tensors = [c.meta["val"] for c in outputs]
     check_meta_consistency(xs_fake_tensors, output_fake_tensors, "init", "carry")
 
-    _, combine_graph_name = unique_graph_id(
-        proxy_mode, prefix="associative_scan_combine_graph"
-    )
+    _, combine_graph_name = unique_graph_id(proxy_mode, prefix="associative_scan_combine_graph")
     proxy_mode.tracer.root.register_module(combine_graph_name, combine_graph)
 
     args = (combine_graph, xs, additional_inputs)
     proxy_args = pytree.tree_map(proxy_mode.tracer.unwrap_proxy, args)
-    out_proxy = proxy_mode.tracer.create_proxy(
-        "call_function", func_overload, proxy_args, {}, name="associative_scan"
-    )
+    out_proxy = proxy_mode.tracer.create_proxy("call_function", func_overload, proxy_args, {}, name="associative_scan")
     with disable_proxy_modes_tracing():
         out = tuple(aten.clone(x) for x in xs)
     return track_tensor_tree(out, out_proxy, constant=None, tracer=proxy_mode.tracer)
@@ -1183,9 +1155,7 @@ class AssociativeScanAutogradOp(torch.autograd.Function):
         ctx._num_xs = num_xs
         ctx._num_additional_inputs = num_additional_inputs
         ctx._combine_fn = combine_fn
-        xs, additional_inputs = split_into_chunks(
-            operands, [num_xs, num_additional_inputs]
-        )
+        xs, additional_inputs = split_into_chunks(operands, [num_xs, num_additional_inputs])
         scan_length = xs[0].shape[0]
         ctx._scan_length = scan_length
 
@@ -1218,9 +1188,7 @@ class AssociativeScanAutogradOp(torch.autograd.Function):
 
         # Extract the inputs to the forward path and outputs from the forward path
         flat_args = saved_tensors_and_symints(ctx)
-        xs, outs, additional_inputs = split_into_chunks(
-            flat_args, [num_xs, num_xs, num_additional_inputs]
-        )
+        xs, outs, additional_inputs = split_into_chunks(flat_args, [num_xs, num_xs, num_additional_inputs])
         ndim = outs[0].ndim
 
         # First_slice_copy does not keep the original requires_grad flag,
@@ -1228,9 +1196,7 @@ class AssociativeScanAutogradOp(torch.autograd.Function):
         xs_slices = first_slice_copy_with_grad(list(itertools.chain(xs, xs)))
 
         # 2.) Prepare the backward graph
-        ctx._combine_fn_bw = create_bw_fn(
-            ctx._combine_fn, (*xs_slices, *additional_inputs)
-        )
+        ctx._combine_fn_bw = create_bw_fn(ctx._combine_fn, (*xs_slices, *additional_inputs))
 
         # 3.) Materialize the ``ctx._combine_fn_bw``
         # TODO: we need to materialize the bw graphs because dynamo is unable to
@@ -1251,18 +1217,14 @@ class AssociativeScanAutogradOp(torch.autograd.Function):
         # 4.) Compute the instantaneous gradients at every step ``t``
         # Use a ones_like tensor in order not to scale the g_h_t and g_x_t
         dummy_upstream_grad = (torch.ones_like(x) for x in flat_grads)
-        grads = mapped_combine_fn_bw_gm(
-            *(o.roll(1, dim) for o in outs), *xs, *dummy_upstream_grad
-        )
+        grads = mapped_combine_fn_bw_gm(*(o.roll(1, dim) for o in outs), *xs, *dummy_upstream_grad)
         g_h_t, g_x_t = split_into_chunks(grads, [num_xs, num_xs])
 
         def compute_grad_h_mat(g_h: torch.Tensor) -> torch.Tensor:
             # Prepare a ones and a zeros helper mask in order to easily compute the y_mat
             def compute_helper_tril_mask(diagonal: int) -> torch.Tensor:
                 mask = torch.tril(
-                    torch.ones(
-                        scan_length, scan_length, device=g_h.device, dtype=torch.bool
-                    ),
+                    torch.ones(scan_length, scan_length, device=g_h.device, dtype=torch.bool),
                     diagonal=diagonal,
                 )
                 for _ in range(ndim - 1):
@@ -1370,9 +1332,7 @@ def associative_scan_proxy_mode(mode, combine_fn, xs, additional_inputs):
         A traced associative scan result.
 
     """
-    return trace_associative_scan(
-        mode, associative_scan_op, combine_fn, xs, additional_inputs
-    )
+    return trace_associative_scan(mode, associative_scan_op, combine_fn, xs, additional_inputs)
 
 
 @associative_scan_op.py_impl(FakeTensorMode)
@@ -1410,12 +1370,8 @@ def associative_scan_functionalize(ctx, combine_fn, xs, additional_inputs):
     unwrapped_xs = ctx.unwrap_tensors(xs)
     unwrapped_additional_inputs = ctx.unwrap_tensors(additional_inputs)
     with ctx.redispatch_to_next():
-        functional_combine_fn = ctx.functionalize(
-            _maybe_run_with_interpreter(combine_fn)
-        )
-        ret = associative_scan_op(
-            functional_combine_fn, unwrapped_xs, unwrapped_additional_inputs
-        )
+        functional_combine_fn = ctx.functionalize(_maybe_run_with_interpreter(combine_fn))
+        ret = associative_scan_op(functional_combine_fn, unwrapped_xs, unwrapped_additional_inputs)
     return ctx.wrap_tensors(ret)
 
 
@@ -1438,23 +1394,15 @@ def _fake_associative_scan(combine_fn, xs, dim, reverse: bool = False):
     op = reversed if reverse else lambda x: x
 
     for ind in op(range(inp_leaves[0].size(dim))):
-        r = [
-            inp_leaves[leave_ind][(slice(None),) * dim + (ind,)]
-            for leave_ind in range(num_leaves)
-        ]
-        if (ind > 0 and not reverse) or (
-            ind < (inp_leaves[0].size(dim) - 1) and reverse
-        ):
+        r = [inp_leaves[leave_ind][(slice(None),) * dim + (ind,)] for leave_ind in range(num_leaves)]
+        if (ind > 0 and not reverse) or (ind < (inp_leaves[0].size(dim) - 1) and reverse):
             r = combine_fn(
                 pytree.tree_unflatten(result_flat[-1], spec),
                 pytree.tree_unflatten(r, spec),
             )
         r_flat, _ = pytree.tree_flatten(r)
         result_flat.append(r_flat)
-    results = [
-        torch.stack([e[leave_ind] for e in op(result_flat)], dim)
-        for leave_ind in range(num_leaves)
-    ]
+    results = [torch.stack([e[leave_ind] for e in op(result_flat)], dim) for leave_ind in range(num_leaves)]
     return pytree.tree_unflatten(results, spec)
 
 
@@ -1479,9 +1427,7 @@ def main():
     additional_inputs = ()
 
     def associative_scan_wrapper(input_tensor):
-        return associative_scan(
-            mul_combine_fn, input_tensor, dim=1, reverse=False, combine_mode="generic"
-        )
+        return associative_scan(mul_combine_fn, input_tensor, dim=1, reverse=False, combine_mode="generic")
 
     try:
         # Test gradcheck with compiled version
@@ -1512,11 +1458,7 @@ def main():
         print(f"Second-order gradient check failed (compiled): {e}")
         # Depending on criticality, might want to return or handle differently
 
-    print(
-        "\nRunning fuzzing tests"
-        + (" with JAX comparison" if JAX_AVAILABLE else "")
-        + "..."
-    )
+    print("\nRunning fuzzing tests" + (" with JAX comparison" if JAX_AVAILABLE else "") + "...")
     fuzzer = benchmark_utils.Fuzzer(
         parameters=[
             benchmark_utils.FuzzedParameter(
@@ -1567,7 +1509,9 @@ def main():
         xs_order = str(tensor_properties["xs"]["order"])
         shape = ", ".join(f"{d:>4}" for d in xs_pytorch.shape)
         dtype = str(xs_pytorch.dtype)
-        description = f"shape: ({shape}), dtype: {dtype}, order: {'contiguous' if xs_pytorch.is_contiguous() else xs_order}"
+        description = (
+            f"shape: ({shape}), dtype: {dtype}, order: {'contiguous' if xs_pytorch.is_contiguous() else xs_order}"
+        )
 
         try:
             # Time PyTorch execution (using compiled version)
@@ -1605,9 +1549,7 @@ def main():
                     )
                     continue
 
-                _ = jax_associative_scan(
-                    jax_add_combine_fn, jax_xs, axis=1, reverse=False
-                ).block_until_ready()
+                _ = jax_associative_scan(jax_add_combine_fn, jax_xs, axis=1, reverse=False).block_until_ready()
                 start_time_jax = timeit.default_timer()
                 jax_result = jax_associative_scan(
                     jax_add_combine_fn,
@@ -1639,16 +1581,12 @@ def main():
     if pytorch_times:
         pytorch_mean = np.mean(pytorch_times)
         pytorch_std = np.std(pytorch_times)
-        print(
-            f"\nPyTorch Timings (mean ± std): {pytorch_mean:.6f} ± {pytorch_std:.6f} seconds"
-        )
+        print(f"\nPyTorch Timings (mean ± std): {pytorch_mean:.6f} ± {pytorch_std:.6f} seconds")
 
     if JAX_AVAILABLE and jax_times:
         jax_mean = np.mean(jax_times)
         jax_std = np.std(jax_times)
-        print(
-            f"JAX Timings (mean ± std):             {jax_mean:.6f} ± {jax_std:.6f} seconds"
-        )
+        print(f"JAX Timings (mean ± std):             {jax_mean:.6f} ± {jax_std:.6f} seconds")
     elif JAX_AVAILABLE:
         print("\nNo JAX timings recorded (possibly due to input conversion issues).")
 
