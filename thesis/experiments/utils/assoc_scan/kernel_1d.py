@@ -33,10 +33,10 @@ def get_scan_configs():
         for w in [4, 8]  # Common warp counts for CUDA
     ]
     # Add HIP-specific configs for AMD GPUs, as in 06-fused-attention.py
-    if triton.runtime.driver.active.get_current_target().backend == "hip":
-        configs.extend(
-            [triton.Config({"BLOCK_SIZE": bs}, num_stages=1, num_warps=4, waves_per_eu=3) for bs in [64, 128, 256]]
-        )
+    # if triton.runtime.driver.active.get_current_target().backend == "hip":
+    #     configs.extend(
+    #         [triton.Config({"BLOCK_SIZE": bs}, num_stages=1, num_warps=4, waves_per_eu=3) for bs in [64, 128, 256]]
+    #     )
     return configs
 
 

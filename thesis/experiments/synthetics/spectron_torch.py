@@ -7,7 +7,8 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
+
+from torchaudio.functional import convolve, fftconvolve
 
 from transformers import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutput
@@ -36,8 +37,196 @@ def find_multiple(n: int, k: int) -> int:
     return n + k - (n % k)
 
 
-def sq_relu(x: torch.Tensor) -> torch.Tensor:
-    return F.relu(x) ** 2
+def tensordot_conv(
+    f: torch.Tensor,  # [L, h]
+    u: torch.Tensor,  # [B, H, L, h]
+) -> torch.Tensor:
+    """
+    Performs a causal FFT convolution for projected filters.
+
+    Args:
+        f (Tensor): [L, h] Spectral filters, one length-L kernel per head-channel, 
+            where h = head_dim.
+        u (Tensor): [B, H, L, h] Batched input sequences.
+
+    Returns:
+        Tensor: [B, H, L, h] Causal convolution of each (B, H, h) stream with its 
+        corresponding filter f[:, h].
+
+    Notes:
+        Vectorization order is channels → heads → batch (fastest-changing 
+        dimension first), allowing the operation to fuse into a single CUDA 
+        kernel when using `torch.compile` or `vmap`.
+    """
+    causal_conv = lambda sig, ker: fftconvolve(sig, ker, mode="full")[..., :sig.shape[-1]]
+    cmap = torch.vmap(causal_conv, in_dims=(1, 1), out_dims=0)   # over head dim
+    hmap = torch.vmap(cmap, in_dims=(0, None), out_dims=0)  # over heads
+    bmap = torch.vmap(hmap, in_dims=(0, None), out_dims=0)  # over batches
+    return bmap(u, f).permute(0, 1, 3, 2)                   # [B, H, L, h]
+
+
+@torch.compile
+def stu_conv(filters: torch.Tensor, inputs: torch.Tensor) -> torch.Tensor:
+    r"""Applies K shared filters causally to all channels using nested vmap.
+
+    Performs 1D causal convolution, applying *each* of the ``K_num`` filters
+    provided in `filters` independently to *every* channel (`h`) of the input,
+    across all batches (`B`) and heads (`H`). This implementation uses nested
+    `torch.vmap` calls and results in an expanded output dimension ``K_num``.
+
+    Args:
+        filters (torch.Tensor): Bank of shared filters. Shape: ``[K_len, K_num]``,
+            where ``K_len`` is the kernel length and ``K_num`` is the number
+            of distinct filters.
+        inputs (torch.Tensor): Input sequences (typically pre-projected). Shape:
+            ``[B, H, L, h]``, where ``L`` is sequence length.
+
+    Returns:
+        torch.Tensor: Output tensor after convolution. Shape: ``[B, H, L, K_num, h]``.
+
+    Example::
+
+        >>> B, H, L, h, K_len, K_num = 2, 3, 16, 4, 5, 7
+        >>> filters = torch.randn(K_len, K_num)
+        >>> inputs = torch.randn(B, H, L, h)
+        >>> output = stu_conv(filters, inputs)
+        >>> output.shape
+        torch.Size([2, 3, 16, 7, 4])
+    """
+    if filters.dim() != 2:
+        raise ValueError("filters must be 2D tensor of shape [K_len, K_num]")
+    if inputs.dim() != 4:
+        raise ValueError("inputs must be 4D tensor of shape [B, H, L, h]")
+
+    inputs = inputs.transpose(-1, -2)  # [B, H, h, L]
+    causal_conv = lambda sig, ker: fftconvolve(sig, ker, mode="full")[..., : sig.shape[-1]]
+
+    kmap = torch.vmap(causal_conv, in_dims=(None, 1), out_dims=0)  # Map over K_num filters
+    cmap = torch.vmap(kmap, in_dims=(0, None), out_dims=1)  # Map over h signal, add K dim after h
+    hmap = torch.vmap(cmap, in_dims=(0, None), out_dims=1)  # Map over H signal, add K dim after H
+    bmap = torch.vmap(hmap, in_dims=(0, None), out_dims=0)  # Map over B signal, add K dim before H
+
+    y = bmap(inputs, filters)  # [B, K_num, H, h, L]
+    return y.permute(0, 2, 4, 1, 3)  # [B, H, L, K_num, h]
+
+
+@torch.compile
+def leaky_relu(x: torch.Tensor, squared: bool = True, alpha: float = 1e-2) -> torch.Tensor:
+    r"""Apply the leaky ReLU activation, with optional squaring of the output.
+
+    Args:
+        x (Tensor): Input tensor.
+        squared (bool, optional): If True, returns the square of the leaky ReLU output. 
+            Defaults to True.
+        alpha (float, optional): Slope for the negative part of the input. 
+            Defaults to 1e-2.
+
+    Returns:
+        Tensor: The activated tensor, optionally squared.
+    """
+    out = torch.where(
+        condition=x > 0,
+        input=x,
+        other=alpha * x,
+    )
+    if squared:
+        return out * out
+    return out
+
+
+@torch.compile
+def combine_fn(self, x: Tuple[Any], y: Tuple[Any]) -> Tuple[Any]:
+        """Combine two leaves of the associative scan tree for AA.
+
+        Args:
+            x: First leaf of the scan tree, containing the current state.
+            y: Second leaf of the scan tree, containing the new input.
+
+        Returns:
+            A tuple representing the combined state of the two leaves.
+
+        NOTE:
+
+            Each leaf is a tuple (m, s, n, Z, g) where:
+                - m: Running maximum (for stable online softmax)
+                - s: Running sum of exp(score - m)
+                - n: Running sum of exp(score - m) * value
+                - Z: Running sum of gated outer products
+                - g: Running sum of gates
+
+        """
+        m_x, s_x, n_x, Z_x, g_x = x
+        m_y, s_y, n_y, Z_y, g_y = y
+
+        # Compute the new maximum
+        m_new = torch.max(m_x, m_y)
+
+        # Scaling factors
+        exp_x = torch.exp(m_x - m_new)
+        exp_y = torch.exp(m_y - m_new)
+
+        # Update softmax aggregator components
+        s_new = s_x * exp_x + s_y * exp_y
+        n_new = n_x * exp_x.view(-1, 1) + n_y * exp_y.view(-1, 1)
+
+        # Update gated Z and gate accumulation
+        Z_new = Z_x + Z_y
+        g_new = g_x + g_y
+
+        return (m_new, s_new, n_new, Z_new, g_new)
+
+@torch.compile
+def scan_fn(
+    qk_slice: torch.Tensor,
+    v_slice: torch.Tensor,
+    Z_slice: torch.Tensor,
+    g_slice: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    r"""Associatively scan over a (B, H) stream.
+
+    Args:
+        qk_slice (Tensor): [L] Similarity logits for the stream.
+        v_slice (Tensor): [L, h] L2-normalized V (first-order numerator).
+        Z_slice (Tensor): [L, h, h] Gated outer-product accumulator.
+        g_slice (Tensor): [L] Scalar gate sequence.
+
+    Returns:
+        Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+            - max_cumul (Tensor): [L] Maximum cumulative similarity.
+            - norm_cumul (Tensor): [L] Cumulative normalization factors.
+            - v_cumul (Tensor): [L, h] Cumulative first-order vectors.
+            - Z_cumul (Tensor): [L, h, h] Cumulative second-order matrices.
+            - gate_cumul (Tensor): [L] Cumulative gate values.
+    """
+    leaves = (
+        qk_slice,                   # m (initialized to qk cosine similarity)
+        torch.ones_like(qk_slice),  # s (denominator starts at 1)
+        v_slice,                    # n (V numerator)
+        Z_slice,                    # Z (second-order accumulator)
+        g_slice,                    # g (gate accumulator)
+    )
+    return associative_scan(
+        combine_fn=combine_fn,
+        xs=leaves,
+        dim=0,
+        combine_mode="generic",
+    )
+
+@torch.compile
+def spectron_scan(sim, v, gated_Z, gates):
+    B, H = sim.shape[:2]
+    
+    sim_flat, v_flat, gated_Z_flat, gates_flat = (t.flatten(0, 1) for t in (sim, v, gated_Z, gates))
+    hmap = torch.vmap(scan_fn, in_dims=(0, 0, 0, 0), out_dims=0)
+    bmap = hmap(sim_flat, v_flat, gated_Z_flat, gates_flat)
+
+    return tuple(result.unflatten(0, (B, H)) for result in bmap)
 
 
 class BaseConfigForCausalLM(PretrainedConfig):
@@ -138,197 +327,68 @@ class AssociativeAttention(nn.Module):
         self.wg = nn.Linear(config.head_dim**2, 1)
         self.eps = config.eps
 
-        # Per-head (dim_v x dim_k) scaling matrix, broadcasted across batch and sequence dims
-        # We normalize both K and V which bounds their values to unit magnitude, so this init suffices
-        self.kv_norm_scale = nn.Parameter(torch.ones(1, self.num_heads, 1, self.head_dim, self.head_dim))
+        self.register_parameter("qk_norm_scale", nn.Parameter(torch.empty(1, self.num_heads, 1)))
+        self.register_parameter("kv_norm_scale", nn.Parameter(torch.empty(1, self.num_heads, 1, 1, 1)))
 
-        # Standard choice of init for QK norm for each head, broadcasted across batch and sequence dims
-        self.qk_norm_scale = nn.Parameter(torch.full((1, self.num_heads, 1), 1 / math.sqrt(self.head_dim)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, D = x.shape
         H, h = self.num_heads, self.head_dim
 
-        # [B, H, L, h]
-        q = self.wq(x).view(B, L, H, h).transpose(1, 2)
-        k = self.wk(x).view(B, L, H, h).transpose(1, 2)
-        v = self.wv(x).view(B, L, H, h).transpose(1, 2)
-
-        # Compute similarity between queries and keys
-        sim = torch.einsum("bhlq,bhlk->bhl", q, k)
-        sim = sim * self.qk_norm_scale
-
-        # Take L2-norm and apply KV norm (analogous to QK norm)
-        k = F.normalize(k, dim=-1)
-        v = F.normalize(v, dim=-1)
-
-        # Apply spectral basis
+        bhld = x.view(B, L, H, h).transpose(1, 2)
         if self.use_tensordot:
-            filters = self.tensordot_proj(self.spectral_filters)  # [L, K] @ [K, D] -> [L, D]
-            k = self.tensordot_conv(filters, k)
-            v = self.tensordot_conv(filters, v)
+            approx = self.lora_lo(self.spectral_basis)
+            filters = self.lora_hi(approx)
+            x_tilde = tensordot_conv(filters, bhld)
         else:
-            k = self.full_conv(self.spectral_filters, k)
-            v = self.full_conv(self.spectral_filters, v)
+            x_tilde = self.stu_conv(self.spectral_filters, bhld)
+            x_tilde = x_tilde.permute(0, 2, 3, 1, 4).reshape(B, L, self.k * H * h)
+            x_tilde = self.M_phi(x_tilde)
+        
+        q = self.wq(x_tilde).view(B, L, H, h).transpose(1, 2)
+        k = self.wk(x_tilde).view(B, L, H, h).transpose(1, 2)
+        v = self.wv(x_tilde).view(B, L, H, h).transpose(1, 2)
+        q, k, v = F.normalize(q, dim=-1), F.normalize(k, dim=-1), F.normalize(v, dim=-1)
 
-        # Compute pairwise interactions via outer product
-        if self.use_tensordot:
-            Z = torch.einsum("bhld,bhle->bhlde", v, k)
-        else:
-            Z = torch.einsum("bhlkd,bhlke->bhlde", v, k)  # Contract over K dim
-        Z = Z * self.kv_norm_scale
+        # Inner and outer products (cosine similarity and state covariance matrix)
+        sim = torch.einsum("bhlq,bhlk->bhl", q, k) * self.qk_norm_scale
+        Z   = torch.einsum("bhsn,bhsp->bhspn", k, v) * self.kv_norm_scale
 
-        # [B, H, L, h^2] -> [B, H, L, 1]
-        gate_inputs = Z.view(B, H, L, h**2)
+        gate_inputs = Z.view(B, H, L, -1)
         gates_logits = self.wg(gate_inputs)
 
         # [B, H, L, 1]
-        gates = sq_relu(gates_logits) + self.eps
+        gates = leaky_relu(gates_logits, squared=True) + self.eps
 
         # [B, H, L, 1, 1]
-        gates = gates.unsqueeze(-1)
+        gates = gates.squeeze(-1)
 
         # Apply gating to Z
-        gated_Z = gates * Z
-
-        # Vmap over H dim
-        hmap = torch.vmap(self.scan_fn, in_dims=(0, 0, 0, 0))
-
-        # Vmap over B dim
-        bmap = torch.vmap(hmap, in_dims=(0, 0, 0, 0))
+        gated_Z = Z * gates.unsqueeze(-1).unsqueeze(-1)
 
         # Scan over all dims simultaneously
-        m_scan, s_scan, n_scan, Z_scan, g_scan = bmap(sim, v, gated_Z, gates)
+        m_scan, s_scan, n_scan, Z_scan, g_scan = spectron_scan(sim, v, gated_Z, gates)
 
         # -*- Compute final attention outputs -*-
+        linear_attn = n_scan / (s_scan.unsqueeze(-1) + self.eps)
 
         # Compute online softmax in safe manner
-        softmax_weights = torch.exp(sim - m_scan).unsqueeze(-1).unsqueeze(-1) / (
-            s_scan.unsqueeze(-1).unsqueeze(-1) + self.eps
-        )
+        softmax_weights = torch.exp(sim - m_scan) / (s_scan + self.eps)
 
         # Compute gated accumulation normalization
-        gated_weights = Z_scan / (g_scan + self.eps)
-
-        # Multiplicatively modulate gated weights w/ softmax weights
-        attn_weights = gated_weights * (1.0 + F.silu(softmax_weights))
+        H = Z_scan / (g_scan.unsqueeze(-1).unsqueeze(-1) + self.eps)
+        H = torch.einsum("bhtp,bhtpn->bhtn", q, H)
 
         # Query from the accumulated state history
-        ctxt = torch.einsum("bhld,bhlde->bhle", q, attn_weights)
+        ctx  = torch.einsum("bhld,bhlde->bhle", q, H)
+        qla  = torch.einsum("bhtp,bhtpn->bhtn", q, linear_attn)
+        lerp = ctx + (qla - ctx) * softmax_weights.unsqueeze(-1)
 
         # Concatenate the heads back together
-        ctxt = ctxt.transpose(1, 2).reshape(B, L, -1)
-        output = self.wo(ctxt)
+        y = lerp.transpose(1, 2).reshape(B, L, -1)
+        out = self.wo(y)
 
-        return output
-
-    def combine_fn(self, x: Tuple[Any], y: Tuple[Any]) -> Tuple[Any]:
-        """Combine two leaves of the associative scan tree for AA.
-
-        Args:
-            x: First leaf of the scan tree, containing the current state.
-            y: Second leaf of the scan tree, containing the new input.
-
-        Returns:
-            A tuple representing the combined state of the two leaves.
-
-        NOTE:
-
-            Each leaf is a tuple (m, s, n, Z, g) where:
-                - m: Running maximum (for stable online softmax)
-                - s: Running sum of exp(score - m)
-                - n: Running sum of exp(score - m) * value
-                - Z: Running sum of gated outer products
-                - g: Running sum of gates
-
-        """
-        m_x, s_x, n_x, Z_x, g_x = x
-        m_y, s_y, n_y, Z_y, g_y = y
-
-        # Compute the new maximum
-        m_new = torch.max(m_x, m_y)
-
-        # Scaling factors
-        exp_x = torch.exp(m_x - m_new)
-        exp_y = torch.exp(m_y - m_new)
-
-        # Update softmax aggregator components
-        s_new = s_x * exp_x + s_y * exp_y
-        n_new = n_x * exp_x.unsqueeze(-1) + n_y * exp_y.unsqueeze(-1)
-
-        # Update gated Z and gate accumulation
-        Z_new = Z_x + Z_y
-        g_new = g_x + g_y
-
-        return (m_new, s_new, n_new, Z_new, g_new)
-
-    def scan_fn(self, qk_slice, v_slice, Z_slice, g_slice):
-        """Process a single [B, H] slice."""
-
-        leaves_m = qk_slice  # [L,]
-        leaves_s = torch.ones_like(qk_slice)  # [L,]
-        leaves_n = v_slice  # [L, h]
-        leaves_Z = Z_slice  # [L, h, h]
-        leaves_g = g_slice  # [L, 1, 1]
-
-        leaves = (leaves_m, leaves_s, leaves_n, leaves_Z, leaves_g)
-
-        scan = associative_scan(combine_fn=self.combine_fn, xs=leaves, dim=0, combine_mode="generic")
-        return scan
-
-    def tensordot_conv(self, v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        """Perform a causal 1D convolution via FFT along the sequence dimension
-        for multiheaded inputs (PyTorch version).
-
-        Args:
-        v: torch.Tensor of shape [L, D]
-        u: torch.Tensor of shape [B, H, L, h]
-
-        Returns:
-            torch.Tensor of shape [B, H, L, h]
-
-        Notation:
-            - B: batch size
-            - H: number of heads
-            - L: sequence length
-            - D: hidden dimension
-            - h: head dimension
-
-        """
-        # Split into heads: [L, D] -> [H, L, h]
-        reshaped = lambda x: x.view(u.shape[2], u.shape[1], u.shape[3]).transpose(0, 1)
-
-        # Convolve over channels within each head
-        tr_conv = lambda x, y: F.fftconvolve(x, y, mode="full")[: x.shape[0]]
-        cconv = torch.vmap(tr_conv, in_dims=(0, 0), out_dims=0)
-
-        # Convolve over heads within each batch
-        hconv = lambda u1, f1: cconv(u1.movedim(-1, 0), f1.movedim(-1, 0)).mT
-        hmap = torch.vmap(hconv, in_dims=(0, 0), out_dims=0)
-
-        # Convolve over batches
-        bmap = torch.vmap(hmap, in_dims=(0, None), out_dims=0)
-
-        # Compute final multiheaded convolution
-        return bmap(u, reshaped(v))
-
-    def full_conv(self, v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        """Compute FFT-based convolution for multiheaded inputs.
-
-        Args:
-            v: [L, K] spectral filters (shared across heads).
-            u: [B, H, L, h] inputs for each head (h is per-head feature dim).
-
-        Returns:
-            torch.Tensor: [B, H, L, K, h] output of convolving each head's input with each of the K filters.
-        """
-        tr_conv = lambda f, k: torchaudio.functional.fftconvolve(k, f)[: k.shape[0]]
-        mvconv = torch.vmap(tr_conv, in_dims=(1, None), out_dims=1)
-        mmconv = torch.vmap(mvconv, in_dims=(None, 1), out_dims=-1)
-        conv_one = lambda u1: mmconv(v, u1)
-        conv_heads = torch.vmap(conv_one, in_dims=0, out_dims=0)
-        conv_batch = torch.vmap(conv_heads, in_dims=0, out_dims=0)
-        return conv_batch(u)
+        return out
 
 
 class SpectronBlock(nn.Module):

@@ -1126,8 +1126,8 @@ if __name__ == "__main__":
 
     # Dataset parameters
     vocab_size = 16
-    seq_len = 128
-    num_examples = 10000
+    seq_len = 256
+    num_examples = 12800
     num_tokens_to_copy = 16
     target_ignore_idx = -100
     selective = True
@@ -1147,7 +1147,7 @@ if __name__ == "__main__":
 
     # Generate validation dataset
     val_dataset = generate_copy_dataset(
-        num_examples=num_examples // 20,
+        num_examples=1280,
         vocab_size=vocab_size,
         seq_len=seq_len,
         num_tokens_to_copy=num_tokens_to_copy,
@@ -1172,16 +1172,16 @@ if __name__ == "__main__":
     if args.model == "all" or args.model == "spectron":
         spectron = Spectron(
             seq_len=seq_len,
-            d_model=64,
+            d_model=128,
             k=math.ceil(math.log(seq_len)),
-            num_heads=8,
+            num_heads=1,
             vocab_size=vocab_size,
             d_out=vocab_size,
             num_layers=2,
-            dropout=0.1,
+            dropout=0.0,
             use_hankel_L=False,
             use_tensordot=False,
-            r=64,
+            r=128,
             device=device,
         ).to(device)
         models_to_train.append(("Spectron", spectron))
@@ -1189,11 +1189,11 @@ if __name__ == "__main__":
     if args.model == "all" or args.model == "flashstu":
         flash_stu = FlashSTUModel(
             seq_len=seq_len,
-            d_model=64,
+            d_model=128,
             vocab_size=vocab_size,
             num_layers=2,
-            num_heads=8,
-            dropout=0.1,
+            num_heads=1,
+            dropout=0.0,
             use_hankel_L=False,
             use_tensordot=False,
             device=device,
@@ -1203,7 +1203,7 @@ if __name__ == "__main__":
     if args.model == "all" or args.model == "mamba":
         mamba = MambaModel(
             seq_len=seq_len,
-            d_model=64,
+            d_model=128,
             vocab_size=vocab_size,
             num_layers=2,
             device=device,
@@ -1215,7 +1215,7 @@ if __name__ == "__main__":
     for model_name, model in models_to_train:
         print(f"\nTraining {model_name}...")
         loss_history, acc_history, eval_steps = train_model(
-            model, loader, val_loader, attn_mask=None, max_steps=args.steps, eval_interval=args.eval
+            model, loader, val_loader, attn_mask=None, max_steps=20000, eval_interval=args.eval
         )
         results[model_name] = (loss_history, acc_history, eval_steps)
 

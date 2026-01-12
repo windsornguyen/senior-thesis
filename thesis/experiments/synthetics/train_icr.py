@@ -7,8 +7,9 @@ import matplotlib.pyplot as plt
 import time
 from torchaudio.functional import convolve
 
-from typing import Tuple, Sequence
+from typing import Tuple
 
+import datetime
 from tqdm import tqdm
 from torchtune.modules import RotaryPositionalEmbeddings as RoPE
 from thesis.experiments.synthetics.registry import registry
@@ -128,17 +129,17 @@ class Attention(nn.Module):
         # if self.alibi_slopes is None:  # Either RoPE or ALiBi for positional embedding
         q, k = self.rope(q), self.rope(k)
 
-        y = flash_attn_func(  # https://arxiv.org/pdf/2307.08691
-            q=q.to(torch.bfloat16),
-            k=k.to(torch.bfloat16),
-            v=v.to(torch.bfloat16),
-            dropout_p=self.dropout if self.training else 0.0,
-            causal=True,
-            # window_size=(self.window_size, 0), # Set to seq_len if full attention
-            # alibi_slopes=self.alibi_slopes, # https://arxiv.org/pdf/2108.12409
-            # NOTE: Softcapping cannot be used simultaneously with dropout
-            # softcap=self.softcap,  # https://arxiv.org/pdf/2408.00118
-        ).to(torch.float32)
+        # y = flash_attn_func(  # https://arxiv.org/pdf/2307.08691
+        #     q=q.to(torch.bfloat16),
+        #     k=k.to(torch.bfloat16),
+        #     v=v.to(torch.bfloat16),
+        #     dropout_p=self.dropout if self.training else 0.0,
+        #     causal=True,
+        #     # window_size=(self.window_size, 0), # Set to seq_len if full attention
+        #     # alibi_slopes=self.alibi_slopes, # https://arxiv.org/pdf/2108.12409
+        #     # NOTE: Softcapping cannot be used simultaneously with dropout
+        #     # softcap=self.softcap,  # https://arxiv.org/pdf/2408.00118
+        # ).to(torch.float32)
 
         out = y.contiguous().view(bsz, q_len, -1)
         out = self.resid_dropout(self.c_proj(out))
@@ -616,32 +617,32 @@ class SimpleSpectralAttention(nn.Module):
 #         y = torch.fft.irfft(torch.fft.rfft(signal, n) * torch.fft.rfft(filt, n), n)
 #         return y[:L]
 
-#     def td_convfft(
-#         self,
-#         f: torch.Tensor,  # [L, h]
-#         u: torch.Tensor,
-#     ) -> torch.Tensor:  # [B, H, L, h]
-#         """Causal FFT convolution for *projected* filters.
+    # def td_convfft(
+    #     self,
+    #     f: torch.Tensor,  # [L, h]
+    #     u: torch.Tensor,
+    # ) -> torch.Tensor:  # [B, H, L, h]
+    #     """Causal FFT convolution for *projected* filters.
 
-#         Args:
-#             f: Spectral filters, shape **[L, h]**.  One length‑*L* kernel
-#             per head‑channel.  (Usually `h = head_dim`.)
-#             u: Batched input sequences, shape **[B, H, L, h]**.
+    #     Args:
+    #         f: Spectral filters, shape **[L, h]**.  One length‑*L* kernel
+    #         per head‑channel.  (Usually `h = head_dim`.)
+    #         u: Batched input sequences, shape **[B, H, L, h]**.
 
-#         Returns:
-#             Tensor of shape **[B, H, L, h]** containing the causal
-#             convolution of every `(B,H,h)` stream with its corresponding
-#             filter `f[:, h]`.
+    #     Returns:
+    #         Tensor of shape **[B, H, L, h]** containing the causal
+    #         convolution of every `(B,H,h)` stream with its corresponding
+    #         filter `f[:, h]`.
 
-#         Vectorization order: **channels → heads → batch** (fastest‑changing
-#         dimension first) so the operation is fused into a single CUDA
-#         kernel when `torch.compile`/`vmap` is used.
-#         """
-#         causal = lambda sig, ker: self.convfft(sig, ker)  # (L,)×(L,)→(L,)
-#         cmap = torch.vmap(causal, in_dims=(1, 1), out_dims=0)  # over h
-#         hmap = torch.vmap(cmap, in_dims=(0, None), out_dims=0)  # over H
-#         bmap = torch.vmap(hmap, in_dims=(0, None), out_dims=0)  # over B
-#         return bmap(u, f).permute(0, 1, 3, 2)  # [B, H, L, h]
+    #     Vectorization order: **channels → heads → batch** (fastest‑changing
+    #     dimension first) so the operation is fused into a single CUDA
+    #     kernel when `torch.compile`/`vmap` is used.
+    #     """
+    #     causal = lambda sig, ker: self.convfft(sig, ker)  # (L,)×(L,)→(L,)
+    #     cmap = torch.vmap(causal, in_dims=(1, 1), out_dims=0)  # over h
+    #     hmap = torch.vmap(cmap, in_dims=(0, None), out_dims=0)  # over H
+    #     bmap = torch.vmap(hmap, in_dims=(0, None), out_dims=0)  # over B
+    #     return bmap(u, f).permute(0, 1, 3, 2)  # [B, H, L, h]
 
 #     def bhld_convfft(
 #         self,
@@ -1045,7 +1046,7 @@ class SpectralAttention(nn.Module):
         self.wg = nn.Linear(1, self.head_dim)
         # self.gate = nn.Linear(dim, dim)
 
-        self.register_parameter("kv_norm_scale", nn.Parameter(torch.empty(1, 1, 1, self.head_dim, self.head_dim)))
+        self.register_parameter("kv_norm_scale", nn.Parameter(torch.empty(1, self.num_heads, 1, 1, 1)))
         self.register_parameter("qk_norm_scale", nn.Parameter(torch.empty(1, self.num_heads, 1)))
 
         self.reset_parameters()
@@ -1066,10 +1067,10 @@ class SpectralAttention(nn.Module):
         q = self.wq(x_tilde).view(B, L, H, h).transpose(1, 2)  # (B, H, L, h)
         k = self.wk(x_tilde).view(B, L, H, h).transpose(1, 2)  # (B, H, L, h)
         v = self.wv(x_tilde).view(B, L, H, h).transpose(1, 2)  # (B, H, L, h)
-        q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
+        k, v = F.normalize(k, dim=-1), F.normalize(v, dim=-1)
 
-        sim = torch.einsum("bhld,bhld->bhl", q, k) * self.qk_norm_scale
-        Z = torch.einsum("bhsn,bhsp->bhspn", k, v)
+        sim = torch.einsum("bhld,bhld->bhl", q, k)
+        Z = torch.einsum("bhsn,bhsp->bhspn", k, v) * self.kv_norm_scale
 
         gate_input_z = Z.reshape(B, H, L, -1)
         gates_logits_z = self.wg_z(gate_input_z)
@@ -1087,9 +1088,9 @@ class SpectralAttention(nn.Module):
         # ── memory‑neutral interpolation (no gigantic H_prime tensor) ─────────
         Y_base = torch.einsum("bhtp,bhtpn->bhtn", q, H)  # [B,H,L,h]
         Y_lin = torch.einsum("bhtp,bhtpn->bhtn", q, linear_attn.unsqueeze(-2))  # [B,H,L,h]
-        Y = Y_base + (Y_lin - Y_base) * weights[..., None]  # [B,H,L,h]
+        Y_base = Y_base + (Y_lin - Y_base) * weights[..., None]  # [B,H,L,h]
 
-        Y_attn = Y.permute(0, 2, 1, 3).reshape(B, L, D)  # (B, T, d)
+        Y_attn = Y_base.permute(0, 2, 1, 3).reshape(B, L, D)  # (B, T, d)
         Y_attn = F.normalize(Y_attn, dim=-1)
         out = self.wo(Y_attn)
 
@@ -1357,8 +1358,10 @@ class SpectralAttention(nn.Module):
 
     def reset_parameters(self):
         with torch.no_grad():
-            self.qk_norm_scale.fill_(self.head_dim**-0.5)
-            # self.kv_norm_scale.fill_(self.head_dim**-0.5)
+            L = float(self.seq_len)
+            g0 = math.log2(L * L - L)
+            self.qk_norm_scale.fill_(g0)
+            self.kv_norm_scale.fill_(g0)
 
 
 class SpectralAttentionLayer(nn.Module):
@@ -1397,6 +1400,9 @@ class SpectralAttentionLayer(nn.Module):
             use_tensordot=use_tensordot,
             # No dtype passed
         )
+        # self.spectral_attention = SimpleSpectralAttention(
+        #     seq_len, d_model, k, num_heads, use_hankel_L, use_tensordot=use_tensordot, r=r, device=device
+        # )
         # LayerNorm defaults to float32
         self.spec_attn_norm = nn.LayerNorm(d_model)
         self.mlp = MLP(d_model, 4 * d_model)  # MLP uses default dtype
@@ -1488,6 +1494,7 @@ class Spectron(nn.Module):
         # Initialize weights
         base_std = self.d_model**-0.5
         self.apply(lambda m: self._init_weights(m, base_std=base_std))
+        print("Model Parameter Count: %.2fM\n" % (self._get_num_params() / 1e6))
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor = None, **kwargs) -> CausalLMOutput:
         x = self.tok_emb(input_ids)
@@ -1519,6 +1526,10 @@ class Spectron(nn.Module):
 
         elif isinstance(m, nn.Embedding):
             torch.nn.init.normal_(m.weight, mean=0.0, std=base_std)
+    
+    def _get_num_params(self):
+        n_params = sum(p.numel() for p in self.parameters())
+        return n_params
 
 
 # -----------------------------------------------------------------------------
@@ -1782,7 +1793,7 @@ if __name__ == "__main__":
     # Create data loaders using the registry
     print("Creating data loaders via registry...")
     loader, val_loader = registry.create_data_loaders(
-        task_name="mqar",
+        task_name="selective_copying",
         batch_size=args.bsz,
         num_train=num_train,
         num_test=num_test,
@@ -1826,37 +1837,54 @@ if __name__ == "__main__":
         tr_loss, tr_acc, v_loss, v_acc, steps = train_model(
             model, loader, val_loader, max_steps=args.steps, eval_interval=args.eval
         )
-        # Store results only if needed, otherwise just run training
-        # results[model_name] = (loss_history, acc_history, eval_steps)
+        results[model_name] = (tr_loss, tr_acc, v_loss, v_acc, steps)  # Store results
+
+        # --- Save results to file ---
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"training_results_{model_name}_{timestamp}.txt"
+        print(f"Saving training results to {filename}...")
+        with open(filename, "w") as f:
+            f.write(f"Model: {model_name}\n")
+            f.write(f"Evaluation Steps: {steps}\n\n")
+            f.write(f"Training Loss History:\n{tr_loss}\n\n")
+            f.write(f"Training Accuracy History:\n{tr_acc}\n\n")
+            f.write(f"Validation Loss History:\n{v_loss}\n\n")
+            f.write(f"Validation Accuracy History:\n{v_acc}\n")
+        print(f"Results saved.")
+        # --- End save results ---
 
         # Show example predictions after training
         print(f"\n--- Example Predictions for {model_name} ---")
         show_example_predictions(model, model_name, loader.dataset)
 
-    # Example adaptation if you uncomment plotting
-    if len(models_to_train) > 0:  # Check if models were trained
+    # Plotting logic remains the same, but uses the stored results
+    if results and len(models_to_train) > 0:
         plt.style.use("seaborn-v0_8-darkgrid")
-        fig, axes = plt.subplots(2, 1, figsize=(10, 10), sharex=True)  # 2 rows: Loss, Accuracy
+        fig, axes = plt.subplots(2, 1, figsize=(10, 10), sharex=True)
 
-        # Assuming only one model for simplicity, adapt if multiple
-        model_name = models_to_train[0][0]
+        # Plot for the first model trained (adapt if needed for multiple plots)
+        first_model_name = list(results.keys())[0]
+        tr_loss, tr_acc, v_loss, v_acc, steps = results[first_model_name]
 
         # Plot Loss
-        axes[0].plot(steps, tr_loss, label=f"{model_name} Train Loss", color="tab:blue", alpha=0.8)
-        axes[0].plot(steps, v_loss, label=f"{model_name} Val Loss", color="tab:orange", linestyle="--")
+        axes[0].plot(steps, tr_loss, label=f"{first_model_name} Train Loss", color="tab:blue", alpha=0.8)
+        axes[0].plot(steps, v_loss, label=f"{first_model_name} Val Loss", color="tab:orange", linestyle="--")
         axes[0].set_ylabel("Loss")
-        axes[0].set_title(f"Training & Validation Loss ({model_name})")
+        axes[0].set_title(f"Training & Validation Loss ({first_model_name})")
         axes[0].legend()
         axes[0].grid(True)
 
         # Plot Accuracy
-        axes[1].plot(steps, tr_acc, label=f"{model_name} Train Acc", color="tab:blue", alpha=0.8)
-        axes[1].plot(steps, v_acc, label=f"{model_name} Val Acc", color="tab:orange", linestyle="--")
+        axes[1].plot(steps, tr_acc, label=f"{first_model_name} Train Acc", color="tab:blue", alpha=0.8)
+        axes[1].plot(steps, v_acc, label=f"{first_model_name} Val Acc", color="tab:orange", linestyle="--")
         axes[1].set_xlabel("Step")
         axes[1].set_ylabel("Accuracy (%)")
-        axes[1].set_title(f"Training & Validation Accuracy ({model_name})")
+        axes[1].set_title(f"Training & Validation Accuracy ({first_model_name})")
         axes[1].legend()
         axes[1].grid(True)
 
         plt.tight_layout()
-        plt.show()
+        save_plot_filename = f"training_plot_{first_model_name}_{timestamp}.png"  # Use timestamp for plot too
+        plt.savefig(save_plot_filename)
+        print(f"Plot saved to {save_plot_filename}")
+        # plt.show() # Optionally disable showing plot if saving is enough

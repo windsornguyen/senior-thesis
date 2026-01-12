@@ -24,7 +24,7 @@ from thesis.experiments.synthetics.assoc_recall import generate_in_context_recal
 from thesis.experiments.synthetics.args import args
 
 # from flash_attn import flash_attn_func, flash_attn_qkvpacked_func
-from thesis.experiments.utils.assoc_scan import associative_scan
+from thesis.experiments.utils.assoc_scan.kernel import associative_scan
 
 
 class MLP(nn.Module):

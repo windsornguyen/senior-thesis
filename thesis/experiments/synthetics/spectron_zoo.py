@@ -196,7 +196,7 @@ class AssociativeAttention(lnn.Module):
     dim: int
     num_heads: int
     seq_len: int
-    spectral_basis: jnp.ndarray
+    spectral_filters: jnp.ndarray
     use_tensordot: bool = True
     eps: float = 1e-5
 
@@ -235,12 +235,12 @@ class AssociativeAttention(lnn.Module):
         v_norm = normalize(v, p=2.0, axis=-1, eps=self.eps)
 
         if self.use_tensordot:
-            filters = self.tensordot_proj(self.spectral_basis)
+            filters = self.tensordot_proj(self.spectral_filters)
             k_filtered = tensordot_conv(filters, k_norm)
             v_filtered = tensordot_conv(filters, v_norm)
         else:
-            k_filtered = stu_conv(self.spectral_basis, k_norm)
-            v_filtered = stu_conv(self.spectral_basis, v_norm)
+            k_filtered = stu_conv(self.spectral_filters, k_norm)
+            v_filtered = stu_conv(self.spectral_filters, v_norm)
 
         Z = (
             jnp.einsum("bhlkd,bhlke->bhlde", v_filtered, k_filtered)

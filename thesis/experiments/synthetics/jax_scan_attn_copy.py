@@ -20,7 +20,7 @@ from thesis.experiments.synthetics.copying.copying import generate_copying, gene
 # Set platform-specific defaults
 jax.config.update("jax_default_matmul_precision", "float32")
 
-matplotlib.use('TkAgg')
+matplotlib.use("TkAgg")
 
 # ------------------------------------------------------------------------
 # Configuration
@@ -95,6 +95,7 @@ def generate_jax_copy_data(
     new_key = jax.random.split(rng)[0]
 
     return inputs_jax, targets_jax, new_key
+
 
 # ------------------------------------------------------------------------
 # Positional Encoding
@@ -288,6 +289,7 @@ def enforce_associativity(op=None, *, check_flag="check_associativity", sample_k
 #         out = self.wo(context)
 #         return out
 
+
 def get_hankel_matrix(n: int) -> np.ndarray:
     z = np.zeros((n, n))
     for i in range(1, n + 1):
@@ -299,6 +301,7 @@ def get_hankel_matrix(n: int) -> np.ndarray:
 def get_top_hankel_eigh(n: int, k: int) -> tuple[np.ndarray, np.ndarray]:
     eig_vals, eig_vecs = np.linalg.eigh(get_hankel_matrix(n))
     return eig_vals[-k:], eig_vecs[:, -k:]
+
 
 def get_precomputed_spectral_basis(seq_len: int, num_heads: int) -> jnp.ndarray:
     """Precompute the spectral basis for ScanAttention.
@@ -312,6 +315,7 @@ def get_precomputed_spectral_basis(seq_len: int, num_heads: int) -> jnp.ndarray:
     """
     _, spectral_basis = get_top_hankel_eigh(seq_len, num_heads)
     return jnp.array(spectral_basis)
+
 
 @jax.jit
 def conv(filters: jnp.ndarray, keys: jnp.ndarray) -> jnp.ndarray:
@@ -357,6 +361,7 @@ def conv(filters: jnp.ndarray, keys: jnp.ndarray) -> jnp.ndarray:
     conv_over_batch = jax.vmap(lambda keys_batch: conv_over_heads(filters_T, keys_batch), in_axes=0, out_axes=0)
 
     return conv_over_batch(keys)
+
 
 # class ScanAttention(nn.Module):
 #     dim: int
@@ -534,12 +539,13 @@ def conv(filters: jnp.ndarray, keys: jnp.ndarray) -> jnp.ndarray:
 
 #         return output
 
-def normalize(input: jnp.ndarray, 
-              p: float = 2.0, 
-              dim: Union[int, Tuple[int, ...]] = 1, 
-              eps: float = 1e-12) -> jnp.ndarray:
+
+def normalize(
+    input: jnp.ndarray, p: float = 2.0, dim: Union[int, Tuple[int, ...]] = 1, eps: float = 1e-12
+) -> jnp.ndarray:
     norm = jnp.linalg.norm(input, ord=p, axis=dim, keepdims=True)
     return input / jnp.maximum(norm, eps)
+
 
 class ScanAttention(nn.Module):
     dim: int
@@ -547,7 +553,7 @@ class ScanAttention(nn.Module):
     seq_len: int
     spectral_basis: jnp.ndarray
     eps: float = 1e-5
-    
+
     def setup(self):
         self.head_dim = self.dim // self.num_heads
         self.wq = nn.Dense(self.dim)
@@ -557,51 +563,50 @@ class ScanAttention(nn.Module):
         # Gating projection: maps [D/H * D/H] to [1]
         self.gate_proj = nn.Dense(1)
         self.kv_norm_scale = self.param(
-            "kv_norm_scale",
-            lambda rng: jnp.ones((1, self.num_heads, 1, self.head_dim, self.head_dim))
+            "kv_norm_scale", lambda rng: jnp.ones((1, self.num_heads, 1, self.head_dim, self.head_dim))
         )
 
     def combine_fn(self, x, y):
-            """
-            Combines two leaves for gated causal attention with online softmax.
-            Each leaf is a tuple:
-            (m, s, n, Z, g)
-            where:
-            m: the score/logit for numerical stability
-            s: running sum of exp(score-m)
-            n: running sum of exp(score-m)*value
-            Z: the outer product interaction matrix
-            g: the gate value
-            """
-            m_x, s_x, n_x, Z_x, g_x = x
-            m_y, s_y, n_y, Z_y, g_y = y
-            
-            # Compute new maximum
-            m_new = jnp.maximum(m_x, m_y)
-            
-            # Scale factors
-            exp_x = jnp.exp(m_x - m_new)
-            exp_y = jnp.exp(m_y - m_new)
-            
-            # Update softmax components
-            s_new = s_x * exp_x + s_y * exp_y
-            n_new = n_x * exp_x[..., None] + n_y * exp_y[..., None]
-            
-            # Update gated Z and gate accumulation
-            Z_new = Z_x + Z_y
-            g_new = g_x + g_y
-            
-            return (m_new, s_new, n_new, Z_new, g_new)
-    
+        """
+        Combines two leaves for gated causal attention with online softmax.
+        Each leaf is a tuple:
+        (m, s, n, Z, g)
+        where:
+        m: the score/logit for numerical stability
+        s: running sum of exp(score-m)
+        n: running sum of exp(score-m)*value
+        Z: the outer product interaction matrix
+        g: the gate value
+        """
+        m_x, s_x, n_x, Z_x, g_x = x
+        m_y, s_y, n_y, Z_y, g_y = y
+
+        # Compute new maximum
+        m_new = jnp.maximum(m_x, m_y)
+
+        # Scale factors
+        exp_x = jnp.exp(m_x - m_new)
+        exp_y = jnp.exp(m_y - m_new)
+
+        # Update softmax components
+        s_new = s_x * exp_x + s_y * exp_y
+        n_new = n_x * exp_x[..., None] + n_y * exp_y[..., None]
+
+        # Update gated Z and gate accumulation
+        Z_new = Z_x + Z_y
+        g_new = g_x + g_y
+
+        return (m_new, s_new, n_new, Z_new, g_new)
+
     def scan_fn(self, qk_slice, v_slice, Z_slice, g_slice):
         """Process a single (batch, head) slice"""
         # Set up leaf elements
         # qk_slice: [L], v_slice: [L, h], Z_slice: [L, h, h], g_slice: [L, 1, 1]
-        leaves_m = qk_slice                  # [L]
-        leaves_s = jnp.ones_like(qk_slice)   # [L]
-        leaves_n = v_slice                   # [L, h]
-        leaves_Z = Z_slice                   # [L, h, h]
-        leaves_g = g_slice                   # [L, 1, 1]
+        leaves_m = qk_slice  # [L]
+        leaves_s = jnp.ones_like(qk_slice)  # [L]
+        leaves_n = v_slice  # [L, h]
+        leaves_Z = Z_slice  # [L, h, h]
+        leaves_g = g_slice  # [L, 1, 1]
 
         leaves = (leaves_m, leaves_s, leaves_n, leaves_Z, leaves_g)
         return jax.lax.associative_scan(self.combine_fn, leaves, axis=0)
@@ -609,12 +614,12 @@ class ScanAttention(nn.Module):
     def __call__(self, x, training=False):
         B, L, D = x.shape
         H, h = self.num_heads, self.head_dim
-        
+
         # Compute QKV projections
         q = self.wq(x).reshape(B, L, H, h)
         k = self.wk(x).reshape(B, L, H, h)
         v = self.wv(x).reshape(B, L, H, h)
-        
+
         # Transpose for better memory layout
         q = q.transpose(0, 2, 1, 3)  # [B, H, L, h]
         k = k.transpose(0, 2, 1, 3)  # [B, H, L, h]
@@ -656,8 +661,7 @@ class ScanAttention(nn.Module):
 
         # 1. Compute the normalized online softmax weights
         # [B, H, L, 1, 1]
-        softmax_weights = jnp.exp(sim - m_scan)[..., None, None] \
-                        / (s_scan[..., None, None] + self.eps)
+        softmax_weights = jnp.exp(sim - m_scan)[..., None, None] / (s_scan[..., None, None] + self.eps)
 
         # 2. Gated accumulation normalization
         gated_weights = Z_scan / (g_scan + self.eps)
@@ -673,6 +677,7 @@ class ScanAttention(nn.Module):
         output = self.wo(output_normalized)
 
         return output
+
 
 # ------------------------------------------------------------------------
 # Transformer Architecture
@@ -816,14 +821,17 @@ def compute_accuracy(logits, targets, ignore_index=-100):
 def train_step(state, batch, dropout_rng):
     """Single training step."""
     inputs, targets = batch
+
     def loss_fn(params):
         logits = state.apply_fn({"params": params}, inputs, training=True, rngs={"dropout": dropout_rng})
         loss = cross_entropy_loss(logits, targets)
         accuracy = compute_accuracy(logits, targets)
         return loss, accuracy  # Return accuracy directly
+
     (loss, accuracy), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
     return state, loss, accuracy
+
 
 @jax.jit
 def eval_step(state, batch):
@@ -833,6 +841,7 @@ def eval_step(state, batch):
     loss = cross_entropy_loss(logits, targets)
     accuracy = compute_accuracy(logits, targets)
     return loss, accuracy
+
 
 def create_train_state(config, rng):
     """Initialize the training state."""
@@ -857,6 +866,7 @@ def create_train_state(config, rng):
     state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
     return state, rng
+
 
 def train_model(config, state, train_data, val_data, rng):
     """Train the model and evaluate periodically, emphasizing validation accuracy."""
@@ -983,7 +993,7 @@ def visualize_attention_params(state, config):
             sharp = jnp.exp(layer_params["log_sharp"])
 
             params_data.append({"beta": beta, "temp": temp, "sharp": sharp})
-            layer_names.append(f"Layer {i+1}")
+            layer_names.append(f"Layer {i + 1}")
 
         # Create visualizations
         fig, axs = plt.subplots(1, 3, figsize=(15, 5))
@@ -1024,8 +1034,9 @@ def visualize_attention_params(state, config):
             print(f"{name}:")
             for h in range(config.num_heads):
                 print(
-                    f"  Head {h+1}: beta={data['beta'][h]:.4f}, temp={data['temp'][h]:.4f}, sharp={data['sharp'][h]:.4f}"
+                    f"  Head {h + 1}: beta={data['beta'][h]:.4f}, temp={data['temp'][h]:.4f}, sharp={data['sharp'][h]:.4f}"
                 )
+
 
 def compare_models(vanilla_metrics, scan_metrics):
     """Compare performance between vanilla and scan attention models."""
@@ -1138,14 +1149,14 @@ def run_experiments():
     config_base = TransformerConfig(
         vocab_size=32,  # Increased vocab size to accommodate special tokens
         dim=128,  # Embedding dimension
-        num_heads=8,  # Number of attention heads
+        num_heads=1,  # Number of attention heads
         num_layers=2,  # Number of transformer layers
         dropout_rate=0.0,  # Dropout rate for regularization
-        max_seq_len=256,  # Maximum sequence length
+        max_seq_len=1024,  # Maximum sequence length
         learning_rate=3e-4,  # Learning rate
         weight_decay=1e-2,  # Weight decay for regularization
-        attention_type="vanilla",  # Default attention type
-        seq_len=64,  # Sequence length for the copying task
+        attention_type="scan",  # Default attention type
+        seq_len=1024,  # Sequence length for the copying task
         num_tokens_to_copy=16,  # Number of tokens to copy
         train_size=98304,  # Training set size
         val_size=2048,  # Validation set size
@@ -1187,7 +1198,7 @@ def run_experiments():
         for i in range(config_scan.num_layers):
             if f"layers_{i}" in scan_state.params:
                 layer_params = scan_state.params[f"layers_{i}"]["attention"]
-                print(f"\nLayer {i+1}:")
+                print(f"\nLayer {i + 1}:")
 
                 # Beta (softplus sharpness)
                 if "log_beta" in layer_params:
